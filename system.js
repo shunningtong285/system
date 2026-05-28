@@ -10760,7 +10760,7 @@ async function showConsultationForm(appointment) {
                     updatedAt: '更新時間',
                     updatedBy: '更新者'
                 };
-                const hiddenAuditFields = new Set(['billingItemsStructured', 'updatedAt', 'updatedBy', 'sortDate']);
+                const hiddenAuditFields = new Set(['billingItemsStructured', 'prescriptionStructured', 'multiPrescriptions', 'updatedAt', 'updatedBy', 'sortDate']);
 
                 const formatValue = (val) => {
                     if (val === null || val === undefined || val === '') return '（空白）';
@@ -14302,7 +14302,7 @@ async function printPrescriptionInstructions(consultationId, consultationData = 
                     });
                     let compositionHtml = '';
                     if (formulaCompositions.length > 0) {
-                        compositionHtml += '<div style="margin-top: 4px; font-size: 0.5em;">';
+                        compositionHtml += '<div style="margin-top: 4px; font-size: calc(0.5em + 2pt);">';
                         compositionHtml += formulaCompositions.map(fc => 
                             `<span style="display:inline-block;margin-right:12px;">${window.escapeHtml(fc.name)}：${window.escapeHtml(fc.composition)}</span>`
                         ).join('');
@@ -14443,7 +14443,7 @@ async function printPrescriptionInstructions(consultationId, consultationData = 
                     // 方劑組成橫向排列（每行四個）
                     let compositionHtml = '';
                     if (formulaCompositions.length > 0) {
-                        compositionHtml += '<div style="margin-top: 4px; font-size: 0.5em;">';
+                        compositionHtml += '<div style="margin-top: 4px; font-size: calc(0.5em + 2pt);">';
                         compositionHtml += formulaCompositions.map(fc => 
                             `<span style="display:inline-block;margin-right:12px;">${window.escapeHtml(fc.name)}：${window.escapeHtml(fc.composition)}</span>`
                         ).join('');
