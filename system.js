@@ -1161,6 +1161,7 @@ const consultationHistoryPager = {
         return {
             patientId: String(patientId || ''),
             totalCount: 0,
+            countReady: false,
             recordsByIndex: [],
             descPageCache: {},
             descPageCursors: {},
@@ -1216,13 +1217,30 @@ const consultationHistoryPager = {
             state = this.createEmptyPatientState(pid);
             this.patientPagedCache[pid] = state;
         }
-        if (typeof state.totalCount === 'number' && state.totalCount > 0 && !forceRefresh) {
+        if (state.countReady && !forceRefresh) {
             return { success: true, state };
         }
         if (state.mode === 'full' && Array.isArray(state.recordsByIndex) && !forceRefresh) {
             state.totalCount = state.recordsByIndex.length;
+            state.countReady = true;
             return { success: true, state };
         }
+        try {
+            const patient = await getPatientByIdWithRefresh(pid);
+            const aggregateCount = patient && typeof patient.consultationCount === 'number' && patient.consultationCount >= 0
+                ? Math.max(0, Number(patient.consultationCount) || 0)
+                : null;
+            const hasReliableAggregate = aggregateCount !== null && aggregateCount > 0 && !!patient.latestConsultationAt;
+            if (hasReliableAggregate) {
+                const total = aggregateCount;
+                state.totalCount = total;
+                state.countReady = true;
+                state.recordsByIndex = new Array(total);
+                state.mode = 'paged';
+                state.allLoaded = false;
+                return { success: true, state };
+            }
+        } catch (_patientAggregateError) {}
         try {
             if (window.firebaseDataManager && typeof window.firebaseDataManager.ensurePatientConsultationSortDates === 'function') {
                 const backfillResult = await window.firebaseDataManager.ensurePatientConsultationSortDates(pid);
@@ -1236,9 +1254,18 @@ const consultationHistoryPager = {
             const countSnap = await window.firebase.getCountFromServer(q);
             const total = Number(countSnap && countSnap.data && countSnap.data().count) || 0;
             state.totalCount = total;
+            state.countReady = true;
             state.recordsByIndex = new Array(total);
             state.mode = 'paged';
             state.allLoaded = false;
+            try {
+                if (window.firebaseDataManager && typeof window.firebaseDataManager.applyPatientAggregateToCaches === 'function') {
+                    window.firebaseDataManager.applyPatientAggregateToCaches(pid, {
+                        consultationCount: total,
+                        ...(total === 0 ? { latestConsultationAt: null, latestFollowUpDate: null } : {})
+                    });
+                }
+            } catch (_aggregateCachePatchErr) {}
             return { success: true, state };
         } catch (error) {
             console.warn('病歷分頁初始化失敗，改用全量讀取模式:', error);
@@ -1257,6 +1284,7 @@ const consultationHistoryPager = {
         state.mode = 'full';
         state.allLoaded = true;
         state.totalCount = sorted.length;
+        state.countReady = true;
         state.recordsByIndex = sorted.slice();
         state.descPageCache = {};
         state.descPageCursors = {};
@@ -3206,6 +3234,11 @@ async function attachPatientListListener() {
                 patientAscPagesCache = {};
                 patientAscPageCursors = {};
                 patientsCountCache = null;
+                if (window.firebaseDataManager) {
+                    window.firebaseDataManager.patientsCache = null;
+                    window.firebaseDataManager.patientsCacheSource = 'none';
+                    window.firebaseDataManager.patientsCacheFetchedAt = 0;
+                }
                 try {
                     
                     localStorage.removeItem('patients');
@@ -10267,15 +10300,35 @@ async function startConsultation(appointmentId) {
             }
         }
         
+const CONSULTATION_DRAFT_TEXT_FIELD_IDS = [
+    'formSymptoms',
+    'formTongue',
+    'formPulse',
+    'formDiagnosis',
+    'formSyndrome',
+    'formUsage',
+    'formTreatmentCourse',
+    'formInstructions'
+];
+
 let consultationSymptomsDraftState = {
     key: null,
     meta: null,
-    el: null,
-    handler: null,
+    listeners: [],
     saveSoon: null
 };
 
 function buildConsultationSymptomsDraftKey(appointment, patient) {
+    const pid = patient && (patient.id !== undefined && patient.id !== null) ? String(patient.id) : '';
+    const isEditing = appointment && appointment.status === 'completed' && appointment.consultationId;
+    if (isEditing) {
+        return `tcmDraft:consultation:form:v2:pid:${pid}:cid:${String(appointment.consultationId)}`;
+    }
+    const apptId = appointment && (appointment.id !== undefined && appointment.id !== null) ? String(appointment.id) : (typeof currentConsultingAppointmentId !== 'undefined' && currentConsultingAppointmentId !== null ? String(currentConsultingAppointmentId) : '');
+    return `tcmDraft:consultation:form:v2:pid:${pid}:aid:${String(apptId)}`;
+}
+
+function buildLegacyConsultationSymptomsDraftKey(appointment, patient) {
     const pid = patient && (patient.id !== undefined && patient.id !== null) ? String(patient.id) : '';
     const isEditing = appointment && appointment.status === 'completed' && appointment.consultationId;
     if (isEditing) {
@@ -10308,43 +10361,113 @@ function writeConsultationSymptomsDraft(key, next) {
 
 function clearConsultationSymptomsDraft(key) {
     try {
-        localStorage.removeItem(key);
+        if (key) {
+            localStorage.removeItem(key);
+        }
+        if (typeof key === 'string' && key.indexOf('tcmDraft:consultation:form:v2:') === 0) {
+            const legacyKey = key.replace('tcmDraft:consultation:form:v2:', 'tcmDraft:consultation:symptoms:v1:');
+            localStorage.removeItem(legacyKey);
+        }
     } catch (_e) {}
 }
 
-function persistConsultationSymptomsDraft(value) {
-    const key = consultationSymptomsDraftState && consultationSymptomsDraftState.key ? consultationSymptomsDraftState.key : null;
-    if (!key) return;
-    const now = Date.now();
-    const existing = readConsultationSymptomsDraft(key) || {};
-    const prevValue = typeof existing.prevValue === 'string' ? existing.prevValue : '';
-    const prevUpdatedAt = typeof existing.prevUpdatedAt === 'number' ? existing.prevUpdatedAt : 0;
-    const currValue = typeof existing.value === 'string' ? existing.value : '';
-    const currUpdatedAt = typeof existing.updatedAt === 'number' ? existing.updatedAt : 0;
-    const next = { ...existing };
-    if (typeof value !== 'string') value = '';
-    if (value !== currValue) {
-        const currHasText = currValue && currValue.trim();
-        const newHasText = value && value.trim();
-        if (currHasText && currValue !== value) {
-            next.prevValue = currValue;
-            next.prevUpdatedAt = currUpdatedAt || now;
-        } else if (!newHasText && prevValue && prevValue.trim()) {
-            next.prevValue = prevValue;
-            next.prevUpdatedAt = prevUpdatedAt || now;
-        }
-        next.value = value;
-        next.updatedAt = now;
-        if (consultationSymptomsDraftState.meta) {
-            next.meta = consultationSymptomsDraftState.meta;
-        }
-        writeConsultationSymptomsDraft(key, next);
+function getConsultationDraftHtmlText(html) {
+    try {
+        const temp = document.createElement('div');
+        temp.innerHTML = String(html || '');
+        return (temp.textContent || temp.innerText || '').replace(/\u00a0/g, ' ').trim();
+    } catch (_e) {
+        return String(html || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
     }
 }
 
+function normalizeConsultationDraftPrescriptionSections() {
+    if (!Array.isArray(prescriptions)) return [];
+    return prescriptions.map((section, index) => ({
+        name: section && section.name ? String(section.name) : (index === 0 ? '處方' : `處方${index + 1}`),
+        items: Array.isArray(section && section.items) ? JSON.parse(JSON.stringify(section.items)) : [],
+        days: Math.max(1, parseInt(section && section.days, 10) || 5),
+        freq: Math.max(1, parseInt(section && section.freq, 10) || 2),
+        mode: section && section.mode === 'slice' ? 'slice' : 'granule'
+    }));
+}
+
+function normalizeConsultationDraftBillingItems() {
+    return (Array.isArray(selectedBillingItems) ? selectedBillingItems : []).map(item => ({
+        id: item && item.id !== undefined && item.id !== null ? String(item.id) : '',
+        name: item && item.name ? String(item.name) : '',
+        category: item && item.category ? String(item.category) : 'other',
+        price: Number(item && item.price) || 0,
+        unit: item && item.unit ? String(item.unit) : '',
+        description: item && item.description ? String(item.description) : '',
+        quantity: Math.max(1, parseInt(item && item.quantity, 10) || 1),
+        includedInDiscount: item && item.includedInDiscount === false ? false : true,
+        packageUses: Number(item && item.packageUses) || 0,
+        validityDays: Number(item && item.validityDays) || 0,
+        patientId: item && item.patientId ? String(item.patientId) : '',
+        packageRecordId: item && item.packageRecordId ? String(item.packageRecordId) : '',
+        isHistorical: !!(item && item.isHistorical)
+    }));
+}
+
+function collectConsultationDraftPayload() {
+    const fields = {};
+    CONSULTATION_DRAFT_TEXT_FIELD_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        fields[id] = el && 'value' in el ? String(el.value || '') : '';
+    });
+    const acupunctureNotesEl = document.getElementById('formAcupunctureNotes');
+    const prescriptionTextEl = document.getElementById('formPrescription');
+    const billingTextEl = document.getElementById('formBillingItems');
+    return {
+        version: 2,
+        fields,
+        acupunctureNotesHtml: acupunctureNotesEl ? String(acupunctureNotesEl.innerHTML || '') : '',
+        prescription: prescriptionTextEl && 'value' in prescriptionTextEl ? String(prescriptionTextEl.value || '') : '',
+        multiPrescriptions: normalizeConsultationDraftPrescriptionSections(),
+        billingItems: billingTextEl && 'value' in billingTextEl ? String(billingTextEl.value || '') : '',
+        billingItemsStructured: normalizeConsultationDraftBillingItems(),
+        meta: consultationSymptomsDraftState.meta || null,
+        updatedAt: Date.now()
+    };
+}
+
+function hasMeaningfulConsultationDraft(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const fields = payload.fields && typeof payload.fields === 'object' ? payload.fields : {};
+    if (Object.values(fields).some(value => String(value || '').trim())) {
+        return true;
+    }
+    if (getConsultationDraftHtmlText(payload.acupunctureNotesHtml || '')) {
+        return true;
+    }
+    if (String(payload.prescription || '').trim()) {
+        return true;
+    }
+    if (Array.isArray(payload.multiPrescriptions) && payload.multiPrescriptions.some(section => Array.isArray(section && section.items) && section.items.length > 0)) {
+        return true;
+    }
+    if (String(payload.billingItems || '').trim()) {
+        return true;
+    }
+    if (Array.isArray(payload.billingItemsStructured) && payload.billingItemsStructured.length > 0) {
+        return true;
+    }
+    return false;
+}
+
+function persistConsultationSymptomsDraft() {
+    const key = consultationSymptomsDraftState && consultationSymptomsDraftState.key ? consultationSymptomsDraftState.key : null;
+    if (!key) return;
+    const payload = collectConsultationDraftPayload();
+    if (!hasMeaningfulConsultationDraft(payload)) {
+        clearConsultationSymptomsDraft(key);
+        return;
+    }
+    writeConsultationSymptomsDraft(key, payload);
+}
+
 function restoreConsultationSymptomsDraft(appointment, patient) {
-    const el = document.getElementById('formSymptoms');
-    if (!el) return;
     const key = buildConsultationSymptomsDraftKey(appointment, patient);
     consultationSymptomsDraftState.key = key;
     consultationSymptomsDraftState.meta = {
@@ -10354,54 +10477,172 @@ function restoreConsultationSymptomsDraft(appointment, patient) {
         patientName: patient && patient.name ? String(patient.name) : '',
         doctor: currentUserData && currentUserData.username ? String(currentUserData.username) : (currentUser ? String(currentUser) : '')
     };
-    const draft = readConsultationSymptomsDraft(key);
+    let draft = readConsultationSymptomsDraft(key);
+    if (!draft) {
+        draft = readConsultationSymptomsDraft(buildLegacyConsultationSymptomsDraftKey(appointment, patient));
+    }
     if (!draft) return;
-    const rawValue = typeof draft.value === 'string' ? draft.value : '';
-    const rawPrevValue = typeof draft.prevValue === 'string' ? draft.prevValue : '';
-    const valueToRestore = (rawValue && rawValue.trim()) ? rawValue : ((rawPrevValue && rawPrevValue.trim()) ? rawPrevValue : '');
-    if (!valueToRestore) return;
-    const currentVal = el.value || '';
-    if (currentVal !== valueToRestore) {
-        el.value = valueToRestore;
-        showToast('已自動復原未儲存的主訴及現病史暫存內容', 'info');
+
+    let restored = false;
+    const isLegacySymptomsDraft = Object.prototype.hasOwnProperty.call(draft, 'value') || Object.prototype.hasOwnProperty.call(draft, 'prevValue');
+    if (isLegacySymptomsDraft) {
+        const symptomsEl = document.getElementById('formSymptoms');
+        if (!symptomsEl) return;
+        const rawValue = typeof draft.value === 'string' ? draft.value : '';
+        const rawPrevValue = typeof draft.prevValue === 'string' ? draft.prevValue : '';
+        const valueToRestore = (rawValue && rawValue.trim()) ? rawValue : ((rawPrevValue && rawPrevValue.trim()) ? rawPrevValue : '');
+        if (!valueToRestore) return;
+        if ((symptomsEl.value || '') !== valueToRestore) {
+            symptomsEl.value = valueToRestore;
+            restored = true;
+        }
+    } else {
+        const fields = draft.fields && typeof draft.fields === 'object' ? draft.fields : {};
+        CONSULTATION_DRAFT_TEXT_FIELD_IDS.forEach(id => {
+            if (!Object.prototype.hasOwnProperty.call(fields, id)) return;
+            const el = document.getElementById(id);
+            if (!el || !('value' in el)) return;
+            const nextValue = String(fields[id] || '');
+            if (String(el.value || '') !== nextValue) {
+                el.value = nextValue;
+                restored = true;
+            }
+        });
+
+        if (Object.prototype.hasOwnProperty.call(draft, 'acupunctureNotesHtml')) {
+            const acnEl = document.getElementById('formAcupunctureNotes');
+            const nextHtml = String(draft.acupunctureNotesHtml || '');
+            if (acnEl && String(acnEl.innerHTML || '') !== nextHtml) {
+                acnEl.innerHTML = nextHtml;
+                restored = true;
+                if (typeof initializeAcupointNotesSpans === 'function') {
+                    try {
+                        initializeAcupointNotesSpans();
+                    } catch (_e) {}
+                }
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(draft, 'multiPrescriptions')) {
+            const draftSections = Array.isArray(draft.multiPrescriptions) ? draft.multiPrescriptions : [];
+            if (draftSections.length > 0) {
+                prescriptions = draftSections.map((section, index) => ({
+                    name: section && section.name ? String(section.name) : (index === 0 ? '處方' : `處方${index + 1}`),
+                    items: Array.isArray(section && section.items) ? JSON.parse(JSON.stringify(section.items)) : [],
+                    days: Math.max(1, parseInt(section && section.days, 10) || 5),
+                    freq: Math.max(1, parseInt(section && section.freq, 10) || 2),
+                    mode: section && section.mode === 'slice' ? 'slice' : 'granule'
+                }));
+            } else {
+                const diagnosisDefaults = typeof getEffectiveDiagnosisSettings === 'function'
+                    ? getEffectiveDiagnosisSettings()
+                    : { defaultPrescriptionDays: 5, defaultPrescriptionFrequency: 2 };
+                prescriptions = [{
+                    name: '處方',
+                    items: [],
+                    days: diagnosisDefaults.defaultPrescriptionDays || 5,
+                    freq: diagnosisDefaults.defaultPrescriptionFrequency || 2,
+                    mode: (currentInventoryMode === 'slice' ? 'slice' : 'granule')
+                }];
+            }
+            activePrescriptionIndex = 0;
+            selectedPrescriptionItems = prescriptions[0] && Array.isArray(prescriptions[0].items) ? prescriptions[0].items : [];
+            try {
+                const initialMode = prescriptions[0] && prescriptions[0].mode === 'slice' ? 'slice' : 'granule';
+                changeInventoryType(initialMode);
+            } catch (_e) {}
+            if (typeof updatePrescriptionDisplay === 'function') {
+                updatePrescriptionDisplay();
+            }
+            restored = true;
+        } else if (Object.prototype.hasOwnProperty.call(draft, 'prescription')) {
+            const prescriptionEl = document.getElementById('formPrescription');
+            if (prescriptionEl && String(prescriptionEl.value || '') !== String(draft.prescription || '')) {
+                prescriptionEl.value = String(draft.prescription || '');
+                restored = true;
+            }
+        }
+
+        if (Object.prototype.hasOwnProperty.call(draft, 'billingItemsStructured')) {
+            selectedBillingItems = Array.isArray(draft.billingItemsStructured)
+                ? draft.billingItemsStructured.map(item => ({ ...item }))
+                : [];
+            if (typeof updateBillingDisplay === 'function') {
+                updateBillingDisplay();
+            }
+            restored = true;
+        } else if (Object.prototype.hasOwnProperty.call(draft, 'billingItems')) {
+            const billingEl = document.getElementById('formBillingItems');
+            if (billingEl && String(billingEl.value || '') !== String(draft.billingItems || '')) {
+                billingEl.value = String(draft.billingItems || '');
+                restored = true;
+            }
+        }
+    }
+
+    if (restored) {
+        showToast('已自動復原未儲存的診症暫存內容', 'info');
     }
 }
 
 function setupConsultationSymptomsDraftAutosave(appointment, patient) {
-    const el = document.getElementById('formSymptoms');
-    if (!el) return;
     const key = buildConsultationSymptomsDraftKey(appointment, patient);
     consultationSymptomsDraftState.key = key;
-    consultationSymptomsDraftState.el = el;
-    if (consultationSymptomsDraftState.handler) {
-        try {
-            el.removeEventListener('input', consultationSymptomsDraftState.handler);
-        } catch (_e) {}
+    consultationSymptomsDraftState.meta = {
+        appointmentId: appointment && appointment.id !== undefined && appointment.id !== null ? String(appointment.id) : (typeof currentConsultingAppointmentId !== 'undefined' ? String(currentConsultingAppointmentId) : ''),
+        consultationId: appointment && appointment.consultationId ? String(appointment.consultationId) : '',
+        patientId: patient && patient.id !== undefined && patient.id !== null ? String(patient.id) : '',
+        patientName: patient && patient.name ? String(patient.name) : '',
+        doctor: currentUserData && currentUserData.username ? String(currentUserData.username) : (currentUser ? String(currentUser) : '')
+    };
+    if (Array.isArray(consultationSymptomsDraftState.listeners) && consultationSymptomsDraftState.listeners.length > 0) {
+        consultationSymptomsDraftState.listeners.forEach(listener => {
+            try {
+                if (listener && listener.el && listener.eventName && listener.handler) {
+                    listener.el.removeEventListener(listener.eventName, listener.handler);
+                }
+            } catch (_e) {}
+        });
     }
-    consultationSymptomsDraftState.handler = debounce(() => {
+    consultationSymptomsDraftState.listeners = [];
+    const persistDraftDebounced = debounce(() => {
         try {
-            persistConsultationSymptomsDraft(el.value);
+            persistConsultationSymptomsDraft();
         } catch (_e) {}
     }, 400);
     consultationSymptomsDraftState.saveSoon = debounce(() => {
         try {
-            persistConsultationSymptomsDraft(el.value);
+            persistConsultationSymptomsDraft();
         } catch (_e) {}
     }, 50);
-    el.addEventListener('input', consultationSymptomsDraftState.handler);
+
+    CONSULTATION_DRAFT_TEXT_FIELD_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.addEventListener('input', persistDraftDebounced);
+        consultationSymptomsDraftState.listeners.push({ el, eventName: 'input', handler: persistDraftDebounced });
+    });
+
+    const acnEl = document.getElementById('formAcupunctureNotes');
+    if (acnEl) {
+        acnEl.addEventListener('input', persistDraftDebounced);
+        consultationSymptomsDraftState.listeners.push({ el: acnEl, eventName: 'input', handler: persistDraftDebounced });
+    }
 }
 
 function stopConsultationSymptomsDraftAutosave() {
     try {
-        const el = consultationSymptomsDraftState && consultationSymptomsDraftState.el ? consultationSymptomsDraftState.el : null;
-        const handler = consultationSymptomsDraftState && consultationSymptomsDraftState.handler ? consultationSymptomsDraftState.handler : null;
-        if (el && handler) {
-            el.removeEventListener('input', handler);
-        }
+        const listeners = consultationSymptomsDraftState && Array.isArray(consultationSymptomsDraftState.listeners)
+            ? consultationSymptomsDraftState.listeners
+            : [];
+        listeners.forEach(listener => {
+            if (listener && listener.el && listener.eventName && listener.handler) {
+                listener.el.removeEventListener(listener.eventName, listener.handler);
+            }
+        });
     } catch (_e) {}
     if (consultationSymptomsDraftState) {
-        consultationSymptomsDraftState.el = null;
-        consultationSymptomsDraftState.handler = null;
+        consultationSymptomsDraftState.listeners = [];
         consultationSymptomsDraftState.saveSoon = null;
     }
 }
@@ -12950,6 +13191,7 @@ async function printConsultationRecord(consultationId, consultationData = null) 
         const clinicPrint = await resolveClinicSettingsByConsultation(consultation);
         const receiptVisibility = mergeReceiptVisibilitySettings(clinicPrint && clinicPrint.receiptFieldVisibility).receipt;
         const customThankYouText = (clinicPrint && clinicPrint.receiptThankYouText) ? String(clinicPrint.receiptThankYouText).trim() : '';
+        const layout = getReceiptPrintLayoutConfig(getClinicReceiptPaperSize(clinicPrint), 'receipt');
         // Construct receipt HTML with localized labels
         const printContent = `
             <!DOCTYPE html>
@@ -12961,51 +13203,51 @@ async function printConsultationRecord(consultationId, consultationData = null) 
                     body { 
                         font-family: 'Microsoft JhengHei', '微軟正黑體', sans-serif; 
                         margin: 0; 
-                        padding: 10px; 
+                        padding: ${layout.bodyPadding}; 
                         line-height: 1.3;
-                        font-size: 11px;
+                        font-size: ${layout.bodyFontSize};
                     }
                     .receipt-container {
-                        width: 148mm;
-                        height: 210mm;
+                        width: ${layout.containerWidth};
+                        height: ${layout.containerHeight};
                         margin: 0 auto;
                         border: 2px solid #000;
-                        padding: 8px;
+                        padding: ${layout.containerPadding};
                         background: white;
                         box-sizing: border-box;
                     }
                     .clinic-header {
                         text-align: center;
                         border-bottom: 2px double #000;
-                        padding-bottom: 10px;
-                        margin-bottom: 15px;
+                        padding-bottom: ${layout.clinicHeaderPaddingBottom};
+                        margin-bottom: ${layout.clinicHeaderMarginBottom};
                     }
                     .clinic-name {
-                        font-size: 14px;
+                        font-size: ${layout.clinicNameFont};
                         font-weight: bold;
                         margin-bottom: 2px;
                         letter-spacing: 1px;
                     }
                     .clinic-subtitle {
-                        font-size: 10px;
+                        font-size: ${layout.clinicSubtitleFont};
                         color: #666;
                         margin-bottom: 3px;
                     }
                     .receipt-title {
-                        font-size: 14px;
+                        font-size: ${layout.titleFont};
                         font-weight: bold;
                         text-align: center;
-                        margin: 6px 0;
+                        margin: ${layout.titleMargin} 0;
                         letter-spacing: 2px;
                     }
                     .receipt-info {
-                        margin-bottom: 10px;
+                        margin-bottom: ${layout.itemsMarginY};
                     }
                     .info-row {
                         display: flex;
                         justify-content: space-between;
-                        margin-bottom: 3px;
-                        font-size: 11px;
+                        margin-bottom: ${layout.infoRowMarginBottom};
+                        font-size: ${layout.infoFont};
                     }
                     .info-label {
                         font-weight: bold;
@@ -13013,76 +13255,76 @@ async function printConsultationRecord(consultationId, consultationData = null) 
                     .items-section {
                         border-top: 1px solid #000;
                         border-bottom: 1px solid #000;
-                        padding: 6px 0;
-                        margin: 8px 0;
+                        padding: ${layout.itemsPadding} 0;
+                        margin: ${layout.itemsMarginY} 0;
                     }
                     .items-title {
                         font-weight: bold;
                         text-align: center;
                         margin-bottom: 6px;
-                        font-size: 12px;
+                        font-size: ${layout.itemsTitleFont};
                     }
                     .items-table {
                         width: 100%;
-                        font-size: 10px;
+                        font-size: ${layout.itemsTableFont};
                     }
                     .items-table td {
-                        padding: 3px 5px;
+                        padding: ${layout.itemCellPadding};
                         border-bottom: 1px dotted #999;
                     }
                     .total-section {
                         text-align: right;
                         margin: 4px 0;
-                        font-size: 10px;
+                        font-size: ${layout.totalSectionFont};
                         font-weight: bold;
                     }
                     .total-amount {
-                        font-size: 10px;
+                        font-size: ${layout.totalAmountFont};
                         color: #000;
                         border: 1px solid #000;
-                        padding: 2px;
+                        padding: ${layout.totalAmountPadding};
                         display: inline-block;
-                        min-width: 50px;
+                        min-width: ${layout.totalAmountMinWidth};
                         text-align: center;
                     }
                     .prescription-section {
-                        margin: 8px 0;
+                        margin: ${layout.itemsMarginY} 0;
                         border-top: 1px dashed #666;
-                        padding-top: 6px;
+                        padding-top: ${layout.itemsPadding};
                     }
                     .prescription-title {
                         font-weight: bold;
                         margin-bottom: 4px;
-                        font-size: 11px;
+                        font-size: ${layout.sectionTitleFont};
                     }
                     .prescription-content {
                         background: #f9f9f9;
-                        padding: 4px;
+                        padding: ${layout.highlightPadding};
                         border: 1px solid #ddd;
-                        font-size: 10px;
+                        font-size: ${layout.sectionContentFont};
                         line-height: 1.2;
                     }
                     .footer-info {
-                        margin-top: 10px;
+                        margin-top: ${layout.footerMarginTop};
                         border-top: 1px dashed #666;
-                        padding-top: 6px;
-                        font-size: 9px;
+                        padding-top: ${layout.footerPaddingTop};
+                        font-size: ${layout.footerFont};
                         color: #666;
                     }
                     .footer-row {
                         display: flex;
                         justify-content: space-between;
-                        margin-bottom: 2px;
+                        margin-bottom: ${layout.footerRowMarginBottom};
                     }
                     .thank-you {
                         text-align: center;
-                        margin: 8px 0;
+                        margin: ${layout.thankYouMargin} 0;
                         font-weight: bold;
-                        font-size: 11px;
+                        font-size: ${layout.thankYouFont};
                     }
                     .diagnosis-section {
-                        margin: 6px 0;
-                        font-size: 10px;
+                        margin: ${layout.diagnosisMarginY} 0;
+                        font-size: ${layout.diagnosisFont};
                     }
                     .diagnosis-title {
                         font-weight: bold;
@@ -13091,19 +13333,19 @@ async function printConsultationRecord(consultationId, consultationData = null) 
                     }
                     @media print {
                         @page {
-                            size: A5;
-                            margin: 10mm;
+                            size: ${layout.paperSize};
+                            margin: ${layout.pageMargin};
                         }
                         body { 
                             margin: 0; 
                             padding: 0; 
-                            font-size: 11px;
+                            font-size: ${layout.printBodyFontSize};
                         }
                         .receipt-container { 
                             border: 2px solid #000;
                             width: 100%;
                             height: 100%;
-                            padding: 8mm;
+                            padding: ${layout.printPadding};
                         }
                     }
                 </style>
@@ -13206,7 +13448,7 @@ async function printConsultationRecord(consultationId, consultationData = null) 
                     
                     <!-- Total Amount -->
                     <div class="total-section">
-                        <div style="margin-bottom: 4px; font-size: 9px;">${TR.amountDue}${colon}</div>
+                        <div style="margin-bottom: 4px; font-size: ${layout.totalLabelFont};">${TR.amountDue}${colon}</div>
                         <div class="total-amount">HK$ ${totalAmount.toLocaleString()}</div>
                     </div>
                     
@@ -13338,14 +13580,14 @@ async function printConsultationRecord(consultationId, consultationData = null) 
                             return result || consultation.prescription.replace(/\n/g, '<br>');
                         })()}</div>
                         ${medInfoLocalized ? `
-                        <div style="margin-top: 8px; font-size: 12px;">${medInfoLocalized}</div>
+                        <div style="margin-top: 8px; font-size: ${layout.sectionTitleFont};">${medInfoLocalized}</div>
                         ` : ''}
                     </div>
                     ` : ''}
                     
                     <!-- Instructions -->
                     ${consultation.instructions ? `
-                    <div style="margin: 6px 0; font-size: 10px; background: #fff3cd; padding: 6px; border: 1px solid #ffeaa7;">
+                    <div style="margin: 6px 0; font-size: ${layout.sectionContentFont}; background: #fff3cd; padding: ${layout.highlightPadding}; border: 1px solid #ffeaa7;">
                         <strong>${TR.instructions}${colon}</strong><br>
                         ${consultation.instructions}
                     </div>
@@ -13353,7 +13595,7 @@ async function printConsultationRecord(consultationId, consultationData = null) 
                     
                     <!-- Follow-up Reminder -->
                     ${consultation.followUpDate ? `
-                    <div style="margin: 10px 0; font-size: 12px; background: #e3f2fd; padding: 8px; border: 1px solid #90caf9;">
+                    <div style="margin: 10px 0; font-size: ${layout.sectionTitleFont}; background: #e3f2fd; padding: ${layout.highlightPadding}; border: 1px solid #90caf9;">
                         <strong>${TR.followUp}${colon}</strong><br>
                         ${new Date(consultation.followUpDate).toLocaleString(dateLocale)}
                     </div>
@@ -13384,7 +13626,7 @@ async function printConsultationRecord(consultationId, consultationData = null) 
             </html>
         `;
         // Open a new window and print
-        const printWindow = window.open('', '_blank', 'width=500,height=700');
+        const printWindow = window.open('', '_blank', layout.windowFeatures);
         printWindow.document.write(printContent);
         printWindow.document.close();
         printWindow.focus();
@@ -13493,6 +13735,7 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
             watermark: isEnglish ? 'Arrival Certificate' : '到診證明'
         };
         const clinicPrint = await resolveClinicSettingsByConsultation(consultation);
+        const layout = getReceiptPrintLayoutConfig(getClinicReceiptPaperSize(clinicPrint), 'certificate');
         // Build certificate HTML
         const printContent = `
             <!DOCTYPE html>
@@ -13504,17 +13747,17 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                     body { 
                         font-family: 'Microsoft JhengHei', '微軟正黑體', sans-serif; 
                         margin: 0; 
-                        padding: 8px; 
+                        padding: ${layout.bodyPadding}; 
                         line-height: 1.3;
-                        font-size: 10px;
+                        font-size: ${layout.bodyFontSize};
                         background: white;
                     }
                     .certificate-container {
-                        width: 148mm;
-                        height: 210mm;
+                        width: ${layout.containerWidth};
+                        height: ${layout.containerHeight};
                         margin: 0 auto;
                         border: 3px solid #000;
-                        padding: 8px;
+                        padding: ${layout.containerPadding};
                         background: white;
                         position: relative;
                         box-sizing: border-box;
@@ -13522,37 +13765,37 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                     .clinic-header {
                         text-align: center;
                         border-bottom: 2px solid #000;
-                        padding-bottom: 10px;
-                        margin-bottom: 15px;
+                        padding-bottom: ${layout.clinicHeaderPaddingBottom};
+                        margin-bottom: ${layout.clinicHeaderMarginBottom};
                     }
                     .clinic-name {
-                        font-size: 13px;
+                        font-size: ${layout.clinicNameFont};
                         font-weight: bold;
                         margin-bottom: 3px;
                         letter-spacing: 1px;
                     }
                     .clinic-subtitle {
-                        font-size: 10px;
+                        font-size: ${layout.clinicSubtitleFont};
                         color: #666;
                         margin-bottom: 4px;
                     }
                     .certificate-title {
-                        font-size: 16px;
+                        font-size: ${layout.titleFont};
                         font-weight: bold;
                         text-align: center;
-                        margin: 8px 0;
+                        margin: ${layout.titleMargin} 0;
                         letter-spacing: 3px;
                         color: #000;
                     }
                     .certificate-number {
                         text-align: right;
-                        font-size: 10px;
+                        font-size: ${layout.numberFont};
                         color: #666;
                         margin-bottom: 10px;
                     }
                     .content-section {
                         margin: 8px 0;
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                         line-height: 1.4;
                     }
                     .patient-info {
@@ -13565,33 +13808,33 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                     }
                     .info-label {
                         font-weight: bold;
-                        min-width: 80px;
+                        min-width: ${layout.infoLabelMinWidth};
                         display: inline-block;
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                     }
                     .info-value {
                         border-bottom: 1px solid #000;
-                        min-width: 120px;
-                        padding: 3px 6px;
+                        min-width: ${layout.infoValueMinWidth};
+                        padding: ${layout.infoValuePadding};
                         margin-left: 6px;
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                     }
                     .attendance-section {
                         margin: 8px 0;
                         background: #e3f2fd;
-                        padding: 6px;
+                        padding: ${layout.highlightPadding};
                         border: 2px solid #2196f3;
                         border-radius: 4px;
                         text-align: center;
                     }
                     .attendance-title {
-                        font-size: 11px;
+                        font-size: ${layout.sectionFont};
                         font-weight: bold;
                         color: #1976d2;
                         margin-bottom: 4px;
                     }
                     .attendance-details {
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                         line-height: 1.3;
                     }
                     .doctor-signature {
@@ -13605,25 +13848,25 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                     }
                     .signature-line {
                         border-bottom: 2px solid #000;
-                        width: 60px;
-                        height: 25px;
+                        width: ${layout.signatureWidth};
+                        height: ${layout.signatureHeight};
                         margin: 6px auto;
                         position: relative;
                     }
                     .signature-label {
-                        font-size: 9px;
+                        font-size: ${layout.signatureLabelFont};
                         color: #666;
                         margin-top: 3px;
                     }
                     .date-section {
                         text-align: right;
-                        font-size: 10px;
+                        font-size: ${layout.dateFont};
                     }
                     .footer-note {
                         margin-top: 15px;
                         padding-top: 8px;
                         border-top: 1px dashed #666;
-                        font-size: 8px;
+                        font-size: ${layout.footerFont};
                         color: #666;
                         text-align: center;
                     }
@@ -13632,7 +13875,7 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                         top: 50%;
                         left: 50%;
                         transform: translate(-50%, -50%) rotate(-45deg);
-                        font-size: 80px;
+                        font-size: ${layout.watermarkFont};
                         color: rgba(0, 0, 0, 0.05);
                         font-weight: bold;
                         z-index: 0;
@@ -13644,19 +13887,19 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                     }
                     @media print {
                         @page {
-                            size: A5;
-                            margin: 10mm;
+                            size: ${layout.paperSize};
+                            margin: ${layout.pageMargin};
                         }
                         body { 
                             margin: 0; 
                             padding: 0; 
-                            font-size: 11px;
+                            font-size: ${layout.printBodyFontSize};
                         }
                         .certificate-container { 
                             border: 3px solid #000;
                             width: 100%;
                             height: 100%;
-                            padding: 8mm;
+                            padding: ${layout.printPadding};
                         }
                     }
                 </style>
@@ -13743,7 +13986,7 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                                 ${(() => {
                                     const regNumber = getDoctorRegistrationNumber(consultation.doctor);
                                     return regNumber ? `
-                                        <div style="margin-top: 5px; font-size: 12px; color: #666;">
+                                        <div style="margin-top: 5px; font-size: ${layout.sectionFont}; color: #666;">
                                             ${TC.registrationNo}${colon}${regNumber}
                                         </div>
                                     ` : '';
@@ -13759,9 +14002,9 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
                                         day: '2-digit'
                                     })}
                                 </div>
-                                <div style="border: 2px solid #000; padding: 15px; text-align: center; background: #f8f9fa;">
+                                <div style="border: 2px solid #000; padding: ${layout.sealPadding}; text-align: center; background: #f8f9fa;">
                                     <div style="font-weight: bold; margin-bottom: 5px;">${TC.clinicSeal}</div>
-                                    <div style="font-size: 12px; color: #666;">${TC.sealNote}</div>
+                                    <div style="font-size: ${layout.sealNoteFont}; color: #666;">${TC.sealNote}</div>
                                 </div>
                             </div>
                         </div>
@@ -13780,7 +14023,7 @@ async function printAttendanceCertificate(consultationId, consultationData = nul
             </html>
         `;
         // Open a new window and print
-        const printWindow = window.open('', '_blank', 'width=700,height=900');
+        const printWindow = window.open('', '_blank', layout.windowFeatures);
         printWindow.document.write(printContent);
         printWindow.document.close();
         printWindow.focus();
@@ -13922,6 +14165,7 @@ async function printSickLeave(consultationId, consultationData = null) {
             watermark: isEnglish ? 'Sick Leave' : '病假證明'
         };
         const clinicPrint = await resolveClinicSettingsByConsultation(consultation);
+        const layout = getReceiptPrintLayoutConfig(getClinicReceiptPaperSize(clinicPrint), 'certificate');
         // 構建 HTML 內容
         const printContent = `
             <!DOCTYPE html>
@@ -13933,17 +14177,17 @@ async function printSickLeave(consultationId, consultationData = null) {
                     body {
                         font-family: 'Microsoft JhengHei', '微軟正黑體', sans-serif;
                         margin: 0;
-                        padding: 8px;
+                        padding: ${layout.bodyPadding};
                         line-height: 1.3;
-                        font-size: 10px;
+                        font-size: ${layout.bodyFontSize};
                         background: white;
                     }
                     .certificate-container {
-                        width: 148mm;
-                        height: 210mm;
+                        width: ${layout.containerWidth};
+                        height: ${layout.containerHeight};
                         margin: 0 auto;
                         border: 3px solid #000;
-                        padding: 8px;
+                        padding: ${layout.containerPadding};
                         background: white;
                         position: relative;
                         box-sizing: border-box;
@@ -13951,37 +14195,37 @@ async function printSickLeave(consultationId, consultationData = null) {
                     .clinic-header {
                         text-align: center;
                         border-bottom: 2px solid #000;
-                        padding-bottom: 10px;
-                        margin-bottom: 15px;
+                        padding-bottom: ${layout.clinicHeaderPaddingBottom};
+                        margin-bottom: ${layout.clinicHeaderMarginBottom};
                     }
                     .clinic-name {
-                        font-size: 13px;
+                        font-size: ${layout.clinicNameFont};
                         font-weight: bold;
                         margin-bottom: 3px;
                         letter-spacing: 1px;
                     }
                     .clinic-subtitle {
-                        font-size: 10px;
+                        font-size: ${layout.clinicSubtitleFont};
                         color: #666;
                         margin-bottom: 4px;
                     }
                     .certificate-title {
-                        font-size: 16px;
+                        font-size: ${layout.titleFont};
                         font-weight: bold;
                         text-align: center;
-                        margin: 8px 0;
+                        margin: ${layout.titleMargin} 0;
                         letter-spacing: 3px;
                         color: #000;
                     }
                     .certificate-number {
                         text-align: right;
-                        font-size: 10px;
+                        font-size: ${layout.numberFont};
                         color: #666;
                         margin-bottom: 10px;
                     }
                     .content-section {
                         margin: 8px 0;
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                         line-height: 1.4;
                     }
                     .patient-info {
@@ -13994,31 +14238,31 @@ async function printSickLeave(consultationId, consultationData = null) {
                     }
                     .info-label {
                         font-weight: bold;
-                        min-width: 80px;
+                        min-width: ${layout.infoLabelMinWidth};
                         display: inline-block;
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                     }
                     .info-value {
                         border-bottom: 1px solid #000;
-                        min-width: 120px;
-                        padding: 3px 6px;
+                        min-width: ${layout.infoValueMinWidth};
+                        padding: ${layout.infoValuePadding};
                         margin-left: 6px;
-                        font-size: 10px;
+                        font-size: ${layout.sectionFont};
                     }
                     .diagnosis-section {
                         margin: 8px 0;
                         background: #f9f9f9;
-                        padding: 6px;
+                        padding: ${layout.highlightPadding};
                         border: 1px solid #ddd;
                         border-radius: 3px;
                     }
                     .rest-period {
                         margin: 8px 0;
-                        font-size: 11px;
+                        font-size: ${layout.sectionFont};
                         font-weight: bold;
                         text-align: center;
                         background: #fff3cd;
-                        padding: 6px;
+                        padding: ${layout.highlightPadding};
                         border: 2px solid #ffc107;
                         border-radius: 4px;
                     }
@@ -14033,25 +14277,25 @@ async function printSickLeave(consultationId, consultationData = null) {
                     }
                     .signature-line {
                         border-bottom: 2px solid #000;
-                        width: 60px;
-                        height: 25px;
+                        width: ${layout.signatureWidth};
+                        height: ${layout.signatureHeight};
                         margin: 6px auto;
                         position: relative;
                     }
                     .signature-label {
-                        font-size: 9px;
+                        font-size: ${layout.signatureLabelFont};
                         color: #666;
                         margin-top: 3px;
                     }
                     .date-section {
                         text-align: right;
-                        font-size: 10px;
+                        font-size: ${layout.dateFont};
                     }
                     .footer-note {
                         margin-top: 15px;
                         padding-top: 8px;
                         border-top: 1px dashed #666;
-                        font-size: 8px;
+                        font-size: ${layout.footerFont};
                         color: #666;
                         text-align: center;
                     }
@@ -14060,7 +14304,7 @@ async function printSickLeave(consultationId, consultationData = null) {
                         top: 50%;
                         left: 50%;
                         transform: translate(-50%, -50%) rotate(-45deg);
-                        font-size: 80px;
+                        font-size: ${layout.watermarkFont};
                         color: rgba(0, 0, 0, 0.05);
                         font-weight: bold;
                         z-index: 0;
@@ -14072,19 +14316,19 @@ async function printSickLeave(consultationId, consultationData = null) {
                     }
                     @media print {
                         @page {
-                            size: A5;
-                            margin: 10mm;
+                            size: ${layout.paperSize};
+                            margin: ${layout.pageMargin};
                         }
                         body {
                             margin: 0;
                             padding: 0;
-                            font-size: 11px;
+                            font-size: ${layout.printBodyFontSize};
                         }
                         .certificate-container {
                             border: 3px solid #000;
                             width: 100%;
                             height: 100%;
-                            padding: 8mm;
+                            padding: ${layout.printPadding};
                         }
                     }
                 </style>
@@ -14121,25 +14365,25 @@ async function printSickLeave(consultationId, consultationData = null) {
                                 <div style="margin-top: 10px; font-weight: bold;">${getDoctorDisplayName(consultation.doctor)}</div>
                                 ${(() => {
                                     const regNumber = getDoctorRegistrationNumber(consultation.doctor);
-                                    return regNumber ? `<div style="margin-top: 5px; font-size: 12px; color: #666;">${SL.registrationNo}${colon}${regNumber}</div>` : '';
+                                    return regNumber ? `<div style="margin-top: 5px; font-size: ${layout.sectionFont}; color: #666;">${SL.registrationNo}${colon}${regNumber}</div>` : '';
                                 })()}
                             </div>
                             <div class="date-section">
                                 <div style="margin-bottom: 20px;"><strong>${SL.issueDate}${colon}</strong><br>${new Date().toLocaleDateString(dateLocale, { year: 'numeric', month: '2-digit', day: '2-digit' })}</div>
-                                <div style="border: 2px solid #000; padding: 15px; text-align: center; background: #f8f9fa;"><div style="font-weight: bold; margin-bottom: 5px;">${SL.clinicSeal}</div><div style="font-size: 12px; color: #666;">${SL.sealNote}</div></div>
+                                <div style="border: 2px solid #000; padding: ${layout.sealPadding}; text-align: center; background: #f8f9fa;"><div style="font-weight: bold; margin-bottom: 5px;">${SL.clinicSeal}</div><div style="font-size: ${layout.sealNoteFont}; color: #666;">${SL.sealNote}</div></div>
                             </div>
                         </div>
                         <div class="footer-note">
                             <div>${SL.footerNote}</div>
                             <div>${SL.footerTel}${colon}${clinicPrint.phone || '(852) 2345-6789'} | ${SL.footerHours}${colon}${clinicPrint.businessHours || '週一至週五 09:00-18:00'}</div>
-                            <div style="margin-top: 10px; font-size: 10px;">${SL.issuedAt}${colon}${new Date().toLocaleString(dateLocale)}</div>
+                            <div style="margin-top: 10px; font-size: ${layout.sectionFont};">${SL.issuedAt}${colon}${new Date().toLocaleString(dateLocale)}</div>
                         </div>
                     </div>
                 </div>
             </body>
             </html>`;
         // 開啟新視窗並列印
-        const printWindow = window.open('', '_blank', 'width=700,height=900');
+        const printWindow = window.open('', '_blank', layout.windowFeatures);
         printWindow.document.write(printContent);
         printWindow.document.close();
         printWindow.focus();
@@ -14586,6 +14830,7 @@ async function printPrescriptionInstructions(consultationId, consultationData = 
         };
         const clinicPrint = await resolveClinicSettingsByConsultation(consultation);
         const prescriptionVisibility = mergeReceiptVisibilitySettings(clinicPrint && clinicPrint.receiptFieldVisibility).prescription;
+        const layout = getReceiptPrintLayoutConfig(getClinicReceiptPaperSize(clinicPrint), 'advice');
         // 構建列印內容
         const printContent = `
             <!DOCTYPE html>
@@ -14597,82 +14842,82 @@ async function printPrescriptionInstructions(consultationId, consultationData = 
                     body {
                         font-family: 'Microsoft JhengHei', '微軟正黑體', sans-serif;
                         margin: 0;
-                        padding: 10px;
+                        padding: ${layout.bodyPadding};
                         line-height: 1.3;
-                        font-size: 11px;
+                        font-size: ${layout.bodyFontSize};
                     }
                     .advice-container {
-                        width: 148mm;
-                        height: 210mm;
+                        width: ${layout.containerWidth};
+                        height: ${layout.containerHeight};
                         margin: 0 auto;
                         border: 2px solid #000;
-                        padding: 8px;
+                        padding: ${layout.containerPadding};
                         background: white;
                         box-sizing: border-box;
                     }
                     .clinic-header {
                         text-align: center;
                         border-bottom: 2px double #000;
-                        padding-bottom: 10px;
-                        margin-bottom: 15px;
+                        padding-bottom: ${layout.clinicHeaderPaddingBottom};
+                        margin-bottom: ${layout.clinicHeaderMarginBottom};
                     }
                     .clinic-name {
-                        font-size: 14px;
+                        font-size: ${layout.clinicNameFont};
                         font-weight: bold;
                         margin-bottom: 2px;
                         letter-spacing: 1px;
                     }
                     .clinic-subtitle {
-                        font-size: 10px;
+                        font-size: ${layout.clinicSubtitleFont};
                         color: #666;
                         margin-bottom: 3px;
                     }
                     .advice-title {
-                        font-size: 14px;
+                        font-size: ${layout.titleFont};
                         font-weight: bold;
                         text-align: center;
-                        margin: 6px 0;
+                        margin: ${layout.titleMargin} 0;
                         letter-spacing: 2px;
                     }
                     .patient-info {
-                        margin-bottom: 10px;
-                        font-size: 11px;
+                        margin-bottom: ${layout.footerPaddingTop};
+                        font-size: ${layout.infoFont};
                     }
                     .info-row {
                         display: flex;
                         justify-content: space-between;
-                        margin-bottom: 3px;
-                        font-size: 11px;
+                        margin-bottom: ${layout.infoRowMarginBottom};
+                        font-size: ${layout.infoFont};
                     }
                     .info-label {
                         font-weight: bold;
                     }
                     .section-title {
                         font-weight: bold;
-                        margin-top: 10px;
-                        margin-bottom: 4px;
-                        font-size: 12px;
+                        margin-top: ${layout.sectionTitleMarginTop};
+                        margin-bottom: ${layout.sectionTitleMarginBottom};
+                        font-size: ${layout.sectionTitleFont};
                     }
                     .section-content {
                         background: #f9f9f9;
-                        padding: 4px;
+                        padding: ${layout.sectionContentPadding};
                         border: 1px solid #ddd;
-                        font-size: 10px;
+                        font-size: ${layout.sectionContentFont};
                         line-height: 1.3;
                         border-radius: 3px;
                     }
                     .thank-you {
                         text-align: center;
-                        margin: 12px 0;
-                        font-size: 11px;
+                        margin: ${layout.thankYouMargin} 0;
+                        font-size: ${layout.thankYouFont};
                         font-weight: bold;
                         color: #333;
                     }
                     .footer-info {
-                        margin-top: 10px;
+                        margin-top: ${layout.footerMarginTop};
                         border-top: 1px dashed #666;
-                        padding-top: 6px;
-                        font-size: 9px;
+                        padding-top: ${layout.footerPaddingTop};
+                        font-size: ${layout.footerFont};
                         color: #666;
                     }
                     .footer-row {
@@ -14682,18 +14927,18 @@ async function printPrescriptionInstructions(consultationId, consultationData = 
                     }
                     @media print {
                         @page {
-                            size: A5;
-                            margin: 10mm;
+                            size: ${layout.paperSize};
+                            margin: ${layout.pageMargin};
                         }
                         body {
                             margin: 0;
                             padding: 0;
-                            font-size: 11px;
+                            font-size: ${layout.printBodyFontSize};
                         }
                         .advice-container {
                             width: 100%;
                             height: 100%;
-                            padding: 8mm;
+                            padding: ${layout.printPadding};
                         }
                     }
                 </style>
@@ -14733,7 +14978,7 @@ async function printPrescriptionInstructions(consultationId, consultationData = 
             </body>
             </html>`;
         // 開啟新視窗並列印
-        const printWindow = window.open('', '_blank', 'width=500,height=700');
+        const printWindow = window.open('', '_blank', layout.windowFeatures);
         printWindow.document.write(printContent);
         printWindow.document.close();
         printWindow.focus();
@@ -15292,305 +15537,48 @@ async function loadPatientConsultationSummary(patientId) {
     }
 
     try {
-        // 始終強制從資料庫取得最新的診症記錄，避免跨裝置快取不一致
-        const result = await window.firebaseDataManager.getPatientConsultations(patientId, true);
-        
-        if (!result.success) {
-            summaryContainer.innerHTML = `
-                <div class="text-center py-8 text-gray-500">
-                    <div class="text-4xl mb-2">❌</div>
-                    <div>無法載入診療記錄</div>
-                </div>
-            `;
-            return;
-        }
-
-        const consultations = result.data;
-        const totalConsultations = consultations.length;
-        const lastConsultation = consultations[0]; // 最新的診療記錄
-
-        // 取得並計算套票狀態
-        let packageStatusHtml = '';
-        // 將套票資料保留在外層作用域，以便後續計算 activePkgCount
-        let pkgs;
+        let patient = await getPatientByIdWithRefresh(patientId);
+        let totalConsultations = patient && typeof patient.consultationCount === 'number'
+            ? Math.max(0, Number(patient.consultationCount) || 0)
+            : 0;
+        let latestConsultation = null;
         try {
-            // 始終強制重新載入套票，避免跨裝置快取不一致
-            pkgs = await getPatientPackages(patientId, true);
-            // 如果有套票紀錄
-            if (Array.isArray(pkgs) && pkgs.length > 0) {
-                // 只顯示有剩餘次數的套票
-                const activePkgs = pkgs.filter(p => p && p.remainingUses > 0);
-                if (activePkgs.length > 0) {
-                    // 按到期日排序，越早到期越前面顯示
-                    activePkgs.sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
-                    
-                    packageStatusHtml = `
-                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                            ${activePkgs.map(pkg => {
-                                const status = formatPackageStatus(pkg);
-                                const expiresAt = new Date(pkg.expiresAt);
-                                const now = new Date();
-                                const daysLeft = Math.ceil((expiresAt - now) / (1000*60*60*24));
-                                
-                                
-                                let statusColor = 'bg-green-50 border-green-200 text-green-800';
-                                let iconColor = 'text-green-600';
-                                let progressColor = 'bg-green-500';
-                                
-                                if (daysLeft <= 7) {
-                                    statusColor = 'bg-red-50 border-red-200 text-red-800';
-                                    iconColor = 'text-red-600';
-                                    progressColor = 'bg-red-500';
-                                } else if (daysLeft <= 30) {
-                                    statusColor = 'bg-yellow-50 border-yellow-200 text-yellow-800';
-                                    iconColor = 'text-yellow-600';
-                                    progressColor = 'bg-yellow-500';
-                                }
-                                
-                                
-                                const usagePercentage = ((pkg.totalUses - pkg.remainingUses) / pkg.totalUses) * 100;
-                                
-                                return `
-                                    <div class="relative ${statusColor} border rounded-lg p-3 transition-all duration-200 hover:shadow-md">
-                                        <!-- 套票名稱和圖標 -->
-                                        <div class="flex items-start justify-between mb-2">
-                                            <div class="flex items-center space-x-2">
-                                                <div class="${iconColor}">
-                                                    <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 20 20">
-                                                        <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                                                    </svg>
-                                                </div>
-                                                <div class="font-medium text-sm truncate">${pkg.name}</div>
-                                            </div>
-                                            <div class="text-xs font-medium px-2 py-1 rounded-full bg-white bg-opacity-70 whitespace-nowrap">
-                                                ${daysLeft <= 0 ? '已到期' : `${daysLeft}天`}
-                                            </div>
-                                        </div>
-                                        
-                                        <!-- 使用次數和進度條 -->
-                                        <div class="space-y-2">
-                                            <div class="flex justify-between items-center text-xs">
-                                                <span>剩餘 ${pkg.remainingUses}/${pkg.totalUses}</span>
-                                                <span>${Math.round(100 - usagePercentage)}%</span>
-                                            </div>
-                                            
-                                            <!-- 進度條 -->
-                                            <div class="w-full bg-white bg-opacity-50 rounded-full h-1.5">
-                                                <div class="${progressColor} h-1.5 rounded-full transition-all duration-300" 
-                                                     style="width: ${usagePercentage}%"></div>
-                                            </div>
-                                            
-                                            <!-- 到期日 -->
-                                            <div class="text-xs opacity-75 truncate">
-                                                ${expiresAt.toLocaleDateString('zh-TW')}
-                                            </div>
-                                        </div>
-                                        
-                                        <!-- 緊急標記 -->
-                                        ${daysLeft <= 7 && daysLeft > 0 ? `
-                                            <div class="absolute -top-1 -right-1">
-                                                <span class="inline-flex items-center justify-center w-4 h-4 text-xs font-bold text-white bg-red-500 rounded-full animate-pulse">
-                                                    !
-                                                </span>
-                                            </div>
-                                        ` : ''}
-                                    </div>
-                                `;
-                            }).join('')}
-                        </div>`;
-                } else {
-                    // 有套票記錄但已全數用盡
-                    packageStatusHtml = `
-                        <div class="bg-gray-50 border-gray-200 border rounded-lg p-3 text-center">
-                            <div class="text-gray-400 mb-1">
-                                <svg class="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
-                                    <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
-                                </svg>
-                            </div>
-                            <div class="text-sm font-medium text-gray-600">無可用套票</div>
-                            <div class="text-xs text-gray-500 mt-1">所有套票已用完或過期</div>
-                        </div>
-                    `;
-                }
-            } else {
-                // 無套票記錄
-                packageStatusHtml = `
-                    <div class="bg-blue-50 border-blue-200 border rounded-lg p-3 text-center">
-                        <div class="text-blue-400 mb-1">
-                            <svg class="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
-                                <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd"/>
-                            </svg>
-                        </div>
-                        <div class="text-sm font-medium text-blue-700">尚未購買套票</div>
-                        <div class="text-xs text-blue-600 mt-1">可於診療時購買套票享優惠</div>
-                    </div>
-                `;
-            }
-        } catch (err) {
-            console.error('取得套票資訊失敗:', err);
-            packageStatusHtml = `
-                <div class="bg-red-50 border-red-200 border rounded-lg p-3 text-center">
-                    <div class="text-red-400 mb-1">
-                        <svg class="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
-                            <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
-                        </svg>
-                    </div>
-                    <div class="text-sm font-medium text-red-700">載入失敗</div>
-                    <div class="text-xs text-red-600 mt-1">無法載入套票狀態</div>
-                </div>
-            `;
-        }
-
-        // 計算可用套票數量（activePkgCount）。
-        // 優先使用病人文件中的 packageActiveCount 欄位，若不存在則退回至利用 pkgs 計算。
-        let activePkgCount = 0;
-        try {
-            // 嘗試從快取或讀取所有病人資料中取得指定病人
-            let allPatientsForCount = [];
-            if (Array.isArray(patientCache) && patientCache.length > 0) {
-                allPatientsForCount = patientCache;
-            } else {
-                // 若快取不存在，從 Firebase 讀取
-                allPatientsForCount = await fetchPatients();
-            }
-            const targetPatient = allPatientsForCount.find((p) => String(p.id) === String(patientId));
-            if (targetPatient && typeof targetPatient.packageActiveCount === 'number') {
-                activePkgCount = targetPatient.packageActiveCount;
-            } else {
-                // 若病人資料中無彙總欄位，則使用已載入的 pkgs 計算
-                if (Array.isArray(pkgs)) {
-                    activePkgCount = pkgs.filter(p => p && typeof p.remainingUses === 'number' && p.remainingUses > 0).length;
-                } else {
-                    activePkgCount = 0;
-                }
-            }
-        } catch (activeCountErr) {
-            console.error('取得病人可用套票數量失敗:', activeCountErr);
-            // 作為最後保險，使用 pkgs 計算
-            if (Array.isArray(pkgs)) {
-                try {
-                    activePkgCount = pkgs.filter(p => p && typeof p.remainingUses === 'number' && p.remainingUses > 0).length;
-                } catch (fallbackErr) {
-                    activePkgCount = 0;
-                }
-            } else {
-                activePkgCount = 0;
-            }
-        }
-
-        // 產生「套票情況」區塊的 HTML，用於診療摘要中顯示套票資訊
-        let packageSituationInnerHtml = '';
-        try {
-            if (Array.isArray(pkgs) && pkgs.length > 0) {
-                const nowPs = new Date();
-                const soonThresholdPs = new Date(nowPs.getTime() + 7 * 24 * 60 * 60 * 1000);
-                const validPkgsPs = [];
-                const invalidPkgsPs = [];
-                pkgs.forEach(pkg => {
-                    const expDate = new Date(pkg.expiresAt);
-                    const expired = expDate < nowPs || (typeof pkg.remainingUses === 'number' && pkg.remainingUses <= 0);
-                    if (expired) {
-                        invalidPkgsPs.push(pkg);
-                    } else {
-                        validPkgsPs.push(pkg);
+            const stateResult = await consultationHistoryPager.ensurePatientState(patientId, false);
+            if (stateResult && stateResult.success && stateResult.state) {
+                totalConsultations = Math.max(0, Number(stateResult.state.totalCount) || 0);
+                patient = {
+                    ...(patient || {}),
+                    consultationCount: totalConsultations
+                };
+                if (totalConsultations > 0) {
+                    const latestIndex = totalConsultations - 1;
+                    const loaded = await consultationHistoryPager.ensureLoadedAtIndex(patientId, latestIndex);
+                    if (loaded) {
+                        const cachedState = consultationHistoryPager.getCachedPatientState(patientId);
+                        if (cachedState && Array.isArray(cachedState.recordsByIndex)) {
+                            latestConsultation = cachedState.recordsByIndex[latestIndex] || null;
+                        }
                     }
-                });
-                const sortedValidPs = validPkgsPs.slice().sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
-                const sortedInvalidPs = invalidPkgsPs.slice().sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
-                packageSituationInnerHtml = `
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                        <div>
-                            ${sortedValidPs.length > 0 ? `<div class="font-medium text-gray-700 mb-2">有效套票</div>` : ''}
-                            <div class="space-y-2">
-                                ${sortedValidPs.map(pkg => {
-                                    const safePkgName = window.escapeHtml(pkg.name || '');
-                                    const statusText = formatPackageStatus(pkg);
-                                    const safeStatusText = window.escapeHtml(statusText || '');
-                                    const remainingUses = typeof pkg.remainingUses === 'number' ? pkg.remainingUses : '';
-                                    const totalUses = typeof pkg.totalUses === 'number' ? pkg.totalUses : '';
-                                    const expDate = new Date(pkg.expiresAt);
-                                    const lowUses = typeof pkg.remainingUses === 'number' && pkg.remainingUses <= 2;
-                                    const highlight = (expDate <= soonThresholdPs) || lowUses;
-                                    const containerClasses = highlight ? 'bg-red-50 border border-red-200' : 'bg-purple-50 border border-purple-200';
-                                    const nameClass = highlight ? 'text-red-700' : 'text-purple-900';
-                                    const statusClass = highlight ? 'text-red-600' : 'text-gray-600';
-                                    const usesClass = highlight ? 'text-red-700' : 'text-gray-800';
-                                    return `
-                                        <div class="flex items-center justify-between ${containerClasses} rounded p-2">
-                                            <div>
-                                                <div class="font-medium ${nameClass}">${safePkgName}</div>
-                                                <div class="text-xs ${statusClass}">${safeStatusText}</div>
-                                            </div>
-                                            <div class="text-sm ${usesClass}">${remainingUses}${totalUses !== '' ? '/' + totalUses : ''}</div>
-                                        </div>
-                                    `;
-                                }).join('')}
-                            </div>
-                        </div>
-                        <div>
-                            ${sortedInvalidPs.length > 0 ? `<div class="font-medium text-gray-700 mb-2">失效套票</div>` : ''}
-                            <div class="space-y-2">
-                                ${sortedInvalidPs.map(pkg => {
-                                    const safePkgName = window.escapeHtml(pkg.name || '');
-                                    const statusText = formatPackageStatus(pkg);
-                                    const safeStatusText = window.escapeHtml(statusText || '');
-                                    const remainingUses = typeof pkg.remainingUses === 'number' ? pkg.remainingUses : '';
-                                    const totalUses = typeof pkg.totalUses === 'number' ? pkg.totalUses : '';
-                                    return `
-                                        <div class="flex items-center justify-between bg-gray-50 border border-gray-200 rounded p-2">
-                                            <div>
-                                                <div class="font-medium text-gray-500">${safePkgName}</div>
-                                                <div class="text-xs text-gray-400">${safeStatusText}</div>
-                                            </div>
-                                            <div class="text-sm text-gray-500">${remainingUses}${totalUses !== '' ? '/' + totalUses : ''}</div>
-                                        </div>
-                                    `;
-                                }).join('')}
-                            </div>
-                        </div>
-                    </div>
-                `;
-            } else if (Array.isArray(pkgs) && pkgs.length === 0) {
-                // 無套票記錄
-                packageSituationInnerHtml = `
-                    <div class="bg-blue-50 border-blue-200 border rounded-lg p-3 text-center">
-                        <div class="text-blue-400 mb-1">
-                            <svg class="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
-                                <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd"/>
-                            </svg>
-                        </div>
-                        <div class="text-sm font-medium text-blue-700">尚未購買套票</div>
-                        <div class="text-xs text-blue-600 mt-1">可於診療時購買套票享優惠</div>
-                    </div>
-                `;
-            } else {
-                // 取得套票資訊失敗
-                packageSituationInnerHtml = `
-                    <div class="bg-red-50 border-red-200 border rounded-lg p-3 text-center">
-                        <div class="text-red-400 mb-1">
-                            <svg class="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
-                                <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
-                            </svg>
-                        </div>
-                        <div class="text-sm font-medium text-red-700">載入失敗</div>
-                        <div class="text-xs text-red-600 mt-1">無法載入套票狀態</div>
-                    </div>
-                `;
+                }
             }
-        } catch (pkgErr) {
-            console.error('產生套票情況失敗:', pkgErr);
-            packageSituationInnerHtml = `
-                <div class="bg-red-50 border-red-200 border rounded-lg p-3 text-center">
-                    <div class="text-red-400 mb-1">
-                        <svg class="w-6 h-6 mx-auto" fill="currentColor" viewBox="0 0 20 20">
-                            <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7 4a1 1 0 11-2 0 1 1 0 012 0zm-1-9a1 1 0 00-1 1v4a1 1 0 102 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
-                        </svg>
-                    </div>
-                    <div class="text-sm font-medium text-red-700">載入失敗</div>
-                    <div class="text-xs text-red-600 mt-1">無法載入套票狀態</div>
-                </div>
-            `;
+        } catch (_summaryCountErr) {}
+
+        let lastConsultationDate = '無';
+        const latestConsultationAt = patient && patient.latestConsultationAt
+            ? parseConsultationDate(patient.latestConsultationAt)
+            : null;
+        if (latestConsultationAt && !isNaN(latestConsultationAt.getTime())) {
+            lastConsultationDate = latestConsultationAt.toLocaleDateString('zh-TW');
+        } else if (latestConsultation) {
+            const latestConsultationDate = getConsultationEffectiveDate(latestConsultation);
+            if (latestConsultationDate && !isNaN(latestConsultationDate.getTime())) {
+                lastConsultationDate = latestConsultationDate.toLocaleDateString('zh-TW');
+            }
         }
+
+        const activePkgCount = patient && typeof patient.packageActiveCount === 'number'
+            ? Math.max(0, Number(patient.packageActiveCount) || 0)
+            : 0;
 
         if (totalConsultations === 0) {
             summaryContainer.innerHTML = `
@@ -15621,7 +15609,7 @@ async function loadPatientConsultationSummary(patientId) {
                             <h3 class="text-lg font-semibold text-purple-800">套票情況</h3>
                         </div>
                         <div class="text-xs text-purple-600 bg-white px-2 py-1 rounded-full">
-                            ${activePkgCount} 個可用
+                            <span id="patientPackageActiveCountBadge">${activePkgCount}</span> 個可用
                         </div>
                     </div>
                     <!-- 使用動態渲染的套票區塊，初始顯示載入中動畫 -->
@@ -15641,14 +15629,15 @@ async function loadPatientConsultationSummary(patientId) {
             return;
         }
 
-        // 格式化最後診療日期
-        const lastConsultationDate = lastConsultation.date ? 
-            new Date(lastConsultation.date.seconds * 1000).toLocaleDateString('zh-TW') : 
-            new Date(lastConsultation.createdAt.seconds * 1000).toLocaleDateString('zh-TW');
-
         // 格式化下次複診日期
-        const nextFollowUp = lastConsultation.followUpDate ? 
-            new Date(lastConsultation.followUpDate).toLocaleDateString('zh-TW') : '無安排';
+        const nextFollowUpDate = patient && patient.latestFollowUpDate
+            ? parseConsultationDate(patient.latestFollowUpDate)
+            : (latestConsultation && latestConsultation.followUpDate
+                ? parseConsultationDate(latestConsultation.followUpDate)
+                : null);
+        const nextFollowUp = nextFollowUpDate && !isNaN(nextFollowUpDate.getTime())
+            ? nextFollowUpDate.toLocaleDateString('zh-TW')
+            : '無安排';
 
         // 更新診療摘要：第一行顯示基本統計，第二行顯示套票狀態
         summaryContainer.innerHTML = `
@@ -15679,7 +15668,7 @@ async function loadPatientConsultationSummary(patientId) {
                         <h3 class="text-lg font-semibold text-purple-800">套票情況</h3>
                     </div>
                     <div class="text-xs text-purple-600 bg-white px-2 py-1 rounded-full">
-                        ${activePkgCount} 個可用
+                        <span id="patientPackageActiveCountBadge">${activePkgCount}</span> 個可用
                     </div>
                 </div>
                 <!-- 使用動態渲染的套票區塊，初始顯示載入中動畫 -->
@@ -15846,6 +15835,125 @@ async function initializeSystemAfterLogin() {
         const RECEIPT_CUSTOM_FIELDS = ['receiptNo', 'medicalRecordNo', 'patientNumber', 'consultationDate', 'consultationTime'];
         const PRESCRIPTION_CUSTOM_FIELDS = ['medicalRecordNo', 'patientNumber', 'consultationDate', 'consultationTime'];
 
+        function normalizeReceiptPaperSize(rawPaperSize) {
+            return String(rawPaperSize || '').toUpperCase() === 'A4' ? 'A4' : 'A5';
+        }
+
+        function getClinicReceiptPaperSize(settingsObj = null) {
+            const source = settingsObj && typeof settingsObj === 'object' ? settingsObj : clinicSettings;
+            return normalizeReceiptPaperSize(source && source.receiptPaperSize);
+        }
+
+        function getReceiptPrintLayoutConfig(paperSize, layoutType = 'receipt') {
+            const normalizedPaperSize = normalizeReceiptPaperSize(paperSize);
+            const isA4 = normalizedPaperSize === 'A4';
+            const shared = {
+                paperSize: normalizedPaperSize,
+                containerWidth: isA4 ? '210mm' : '148mm',
+                containerHeight: isA4 ? '297mm' : '210mm',
+                pageMargin: isA4 ? '12mm' : '10mm',
+                windowFeatures: isA4 ? 'width=900,height=1200' : 'width=700,height=900'
+            };
+
+            if (layoutType === 'certificate') {
+                return {
+                    ...shared,
+                    bodyPadding: isA4 ? '12px' : '8px',
+                    bodyFontSize: isA4 ? '12px' : '10px',
+                    containerPadding: isA4 ? '12px' : '8px',
+                    clinicHeaderPaddingBottom: isA4 ? '14px' : '10px',
+                    clinicHeaderMarginBottom: isA4 ? '20px' : '15px',
+                    clinicNameFont: isA4 ? '16px' : '13px',
+                    clinicSubtitleFont: isA4 ? '11px' : '10px',
+                    titleFont: isA4 ? '20px' : '16px',
+                    titleMargin: isA4 ? '12px' : '8px',
+                    numberFont: isA4 ? '12px' : '10px',
+                    sectionFont: isA4 ? '12px' : '10px',
+                    infoLabelMinWidth: isA4 ? '110px' : '80px',
+                    infoValueMinWidth: isA4 ? '180px' : '120px',
+                    infoValuePadding: isA4 ? '5px 8px' : '3px 6px',
+                    highlightPadding: isA4 ? '10px' : '6px',
+                    signatureWidth: isA4 ? '100px' : '60px',
+                    signatureHeight: isA4 ? '40px' : '25px',
+                    signatureLabelFont: isA4 ? '10px' : '9px',
+                    watermarkFont: isA4 ? '100px' : '80px',
+                    footerFont: isA4 ? '9px' : '8px',
+                    dateFont: isA4 ? '12px' : '10px',
+                    printBodyFontSize: isA4 ? '12px' : '11px',
+                    printPadding: isA4 ? '12mm' : '8mm',
+                    sealPadding: isA4 ? '22px' : '15px',
+                    sealNoteFont: isA4 ? '12px' : '12px'
+                };
+            }
+
+            if (layoutType === 'advice') {
+                return {
+                    ...shared,
+                    bodyPadding: isA4 ? '14px' : '10px',
+                    bodyFontSize: isA4 ? '12px' : '11px',
+                    containerPadding: isA4 ? '14px' : '8px',
+                    clinicHeaderPaddingBottom: isA4 ? '14px' : '10px',
+                    clinicHeaderMarginBottom: isA4 ? '20px' : '15px',
+                    clinicNameFont: isA4 ? '16px' : '14px',
+                    clinicSubtitleFont: isA4 ? '11px' : '10px',
+                    titleFont: isA4 ? '18px' : '14px',
+                    titleMargin: isA4 ? '12px' : '6px',
+                    infoFont: isA4 ? '12px' : '11px',
+                    infoRowMarginBottom: isA4 ? '5px' : '3px',
+                    sectionTitleFont: isA4 ? '14px' : '12px',
+                    sectionTitleMarginTop: isA4 ? '14px' : '10px',
+                    sectionTitleMarginBottom: isA4 ? '6px' : '4px',
+                    sectionContentFont: isA4 ? '12px' : '10px',
+                    sectionContentPadding: isA4 ? '8px' : '4px',
+                    thankYouMargin: isA4 ? '16px' : '12px',
+                    thankYouFont: isA4 ? '13px' : '11px',
+                    footerMarginTop: isA4 ? '16px' : '10px',
+                    footerPaddingTop: isA4 ? '10px' : '6px',
+                    footerFont: isA4 ? '10px' : '9px',
+                    printBodyFontSize: isA4 ? '12px' : '11px',
+                    printPadding: isA4 ? '10mm' : '8mm'
+                };
+            }
+
+            return {
+                ...shared,
+                bodyPadding: isA4 ? '14px' : '10px',
+                bodyFontSize: isA4 ? '12px' : '11px',
+                containerPadding: isA4 ? '14px' : '8px',
+                clinicHeaderPaddingBottom: isA4 ? '14px' : '10px',
+                clinicHeaderMarginBottom: isA4 ? '20px' : '15px',
+                clinicNameFont: isA4 ? '16px' : '14px',
+                clinicSubtitleFont: isA4 ? '11px' : '10px',
+                titleFont: isA4 ? '18px' : '14px',
+                titleMargin: isA4 ? '12px' : '6px',
+                infoFont: isA4 ? '12px' : '11px',
+                infoRowMarginBottom: isA4 ? '5px' : '3px',
+                itemsPadding: isA4 ? '10px' : '6px',
+                itemsMarginY: isA4 ? '12px' : '8px',
+                itemsTitleFont: isA4 ? '14px' : '12px',
+                itemsTableFont: isA4 ? '12px' : '10px',
+                itemCellPadding: isA4 ? '5px 6px' : '3px 5px',
+                totalSectionFont: isA4 ? '12px' : '10px',
+                totalLabelFont: isA4 ? '11px' : '9px',
+                totalAmountFont: isA4 ? '14px' : '10px',
+                totalAmountPadding: isA4 ? '4px 8px' : '2px',
+                totalAmountMinWidth: isA4 ? '80px' : '50px',
+                sectionTitleFont: isA4 ? '12px' : '11px',
+                sectionContentFont: isA4 ? '12px' : '10px',
+                footerMarginTop: isA4 ? '16px' : '10px',
+                footerPaddingTop: isA4 ? '10px' : '6px',
+                footerFont: isA4 ? '10px' : '9px',
+                footerRowMarginBottom: isA4 ? '4px' : '2px',
+                thankYouMargin: isA4 ? '12px' : '8px',
+                thankYouFont: isA4 ? '13px' : '11px',
+                diagnosisMarginY: isA4 ? '10px' : '6px',
+                diagnosisFont: isA4 ? '12px' : '10px',
+                highlightPadding: isA4 ? '10px' : '6px',
+                printBodyFontSize: isA4 ? '12px' : '11px',
+                printPadding: isA4 ? '10mm' : '8mm'
+            };
+        }
+
         function getDefaultReceiptVisibilitySettings() {
             return {
                 receipt: {
@@ -15900,6 +16008,8 @@ async function initializeSystemAfterLogin() {
                 const prescriptionEl = document.getElementById(`prescriptionField_${field}`);
                 if (prescriptionEl) prescriptionEl.checked = !!settings.prescription[field];
             });
+            const paperSizeEl = document.getElementById('receiptPaperSizeSetting');
+            if (paperSizeEl) paperSizeEl.value = getClinicReceiptPaperSize();
         }
 
         function collectReceiptCustomizationUI() {
@@ -15984,6 +16094,7 @@ async function initializeSystemAfterLogin() {
                     phone,
                     address,
                     receiptThankYouText,
+                    receiptPaperSize: 'A5',
                     herbInventoryEnabled: true,
                     createdAt: new Date()
                 });
@@ -16169,10 +16280,14 @@ async function initializeSystemAfterLogin() {
                 return;
             }
             try {
+                const paperSizeEl = document.getElementById('receiptPaperSizeSetting');
+                const receiptPaperSize = normalizeReceiptPaperSize(paperSizeEl ? paperSizeEl.value : 'A5');
                 clinicSettings.receiptFieldVisibility = collectReceiptCustomizationUI();
+                clinicSettings.receiptPaperSize = receiptPaperSize;
                 clinicSettings.updatedAt = new Date().toISOString();
                 await window.firebaseDataManager.updateClinic(currentClinicId, {
                     receiptFieldVisibility: clinicSettings.receiptFieldVisibility,
+                    receiptPaperSize: clinicSettings.receiptPaperSize,
                     updatedAt: clinicSettings.updatedAt
                 });
                 const listRes = await window.firebaseDataManager.getClinics();
@@ -18115,7 +18230,7 @@ async function initializeSystemAfterLogin() {
         function addToPrescription(type, itemId) {
             // 取得目標藥材資料
             const item = herbLibrary.find(h => h.id === itemId);
-            if (!item) return;
+            if (!item) return null;
 
             // 不阻止禁忌配伍的藥材加入處方，但稍後會在全局檢查中顯示錯誤提示
             
@@ -18129,7 +18244,7 @@ async function initializeSystemAfterLogin() {
                     const msg = lang === 'en' ? enMsg : zhMsg;
                     showToast(msg, 'warning');
                 }
-                return;
+                return null;
             }
             
             // 添加到已選擇項目
@@ -18186,6 +18301,7 @@ async function initializeSystemAfterLogin() {
                 const msg = lang && lang.toLowerCase().startsWith('en') ? enMsg : zhMsg;
                 showToast(msg, 'success');
             }
+            return prescriptionItem;
         }
         
 
@@ -18460,6 +18576,7 @@ async function initializeSystemAfterLogin() {
             } catch (_e) {
                 /* 忽略任何錯誤以避免影響其他功能 */
             }
+            queueConsultationSymptomsDraftSave();
         }
         
         // 依特定處方更新服藥天數
@@ -18989,6 +19106,7 @@ async function searchBillingForConsultation() {
                 `;
                 hiddenTextarea.value = '';
                 totalAmountSpan.textContent = '$0';
+                queueConsultationSymptomsDraftSave();
                 return;
             }
             
@@ -19229,6 +19347,7 @@ async function searchBillingForConsultation() {
             }
             billingText += `\n總費用：$${Math.round(totalAmount)}`;
             hiddenTextarea.value = billingText.trim();
+            queueConsultationSymptomsDraftSave();
         }
         
         // 更新收費項目數量
@@ -22662,6 +22781,12 @@ async function importClinicBackup(data) {
                             dataToWrite.sortDate = sortDate;
                         }
                     }
+                    if (collectionName === 'patients') {
+                        dataToWrite.searchKeywords = generateSearchKeywords({
+                            ...dataToWrite,
+                            patientNumber: dataToWrite.patientNumber
+                        });
+                    }
                     batch.set(docRef, dataToWrite);
                     opCount++;
                     if (opCount >= 500) {
@@ -23722,8 +23847,8 @@ async function renderPackageStatusSection(patientId, pageChange = false) {
         if (!pageChange) {
             paginationSettings.patientPackageStatus.currentPage = 1;
         }
-        // 讀取所有套票（強制刷新以避免跨裝置快取不一致）
-        const pkgs = await getPatientPackages(patientId, true);
+        // 查看詳細資料時優先使用快取，避免每次開啟視窗都重新抓取套票。
+        const pkgs = await getPatientPackages(patientId, false);
         // 若無套票資料，顯示提示文字並隱藏分頁控制
         if (!Array.isArray(pkgs) || pkgs.length === 0) {
             contentEl.innerHTML = `
@@ -23770,6 +23895,10 @@ async function renderPackageStatusSection(patientId, pageChange = false) {
                 validPkgs.push(pkg);
             }
         });
+        const packageCountBadge = document.getElementById('patientPackageActiveCountBadge');
+        if (packageCountBadge) {
+            packageCountBadge.textContent = String(validPkgs.length);
+        }
         // 按到期日排序
         validPkgs.sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
         invalidPkgs.sort((a, b) => new Date(a.expiresAt) - new Date(b.expiresAt));
@@ -24273,6 +24402,8 @@ class FirebaseDataManager {
         this.isReady = false;
         // 用於緩存病人列表，避免在同一工作階段重複向 Firestore 讀取整個 patients 集合
         this.patientsCache = null;
+        this.patientsCacheSource = 'none';
+        this.patientsCacheFetchedAt = 0;
         // 用於緩存診症記錄列表與其分頁資訊
         this.consultationsCache = null;
         this.consultationsLastVisible = null;
@@ -24291,6 +24422,142 @@ class FirebaseDataManager {
         await waitForFirebase();
         this.isReady = true;
         console.log('Firebase 數據管理器已準備就緒');
+    }
+
+    applyPatientAggregateToCaches(patientId, aggregatePatch) {
+        const pid = String(patientId || '');
+        if (!pid || !aggregatePatch || typeof aggregatePatch !== 'object') return;
+
+        const applyPatchToList = (list) => {
+            if (!Array.isArray(list)) return false;
+            let updated = false;
+            for (let i = 0; i < list.length; i++) {
+                const patient = list[i];
+                if (patient && String(patient.id) === pid) {
+                    list[i] = { ...patient, ...aggregatePatch };
+                    updated = true;
+                }
+            }
+            return updated;
+        };
+
+        if (Array.isArray(this.patientsCache)) {
+            applyPatchToList(this.patientsCache);
+        }
+
+        Object.keys(patientPagesCache).forEach((pageKey) => {
+            applyPatchToList(patientPagesCache[pageKey]);
+        });
+        Object.keys(patientAscPagesCache).forEach((pageKey) => {
+            applyPatchToList(patientAscPagesCache[pageKey]);
+        });
+
+        try {
+            const stored = localStorage.getItem('patients');
+            if (stored) {
+                const patients = JSON.parse(stored);
+                if (Array.isArray(patients) && applyPatchToList(patients)) {
+                    localStorage.setItem('patients', JSON.stringify(patients));
+                }
+            }
+        } catch (_lsErr) {}
+    }
+
+    async getLatestPatientConsultation(patientId) {
+        if (!this.isReady) return { success: false, data: null };
+        const pid = String(patientId || '');
+        if (!pid) return { success: false, data: null, error: 'missing_patient_id' };
+
+        try {
+            if (typeof this.ensurePatientConsultationSortDates === 'function') {
+                const backfillResult = await this.ensurePatientConsultationSortDates(pid);
+                if (!backfillResult || !backfillResult.success) {
+                    console.warn('取得最新診症前補 sortDate 失敗:', backfillResult && backfillResult.error);
+                }
+            }
+
+            await waitForFirebaseDb();
+            const colRef = window.firebase.collection(window.firebase.db, 'consultations');
+            const q = window.firebase.firestoreQuery(
+                colRef,
+                window.firebase.where('patientId', '==', pid),
+                window.firebase.orderBy('sortDate', 'desc'),
+                window.firebase.limit(1)
+            );
+            const snapshot = await window.firebase.getDocs(q);
+            if (!snapshot || !snapshot.docs || snapshot.docs.length === 0) {
+                return { success: true, data: null };
+            }
+
+            const latestDoc = snapshot.docs[0];
+            return { success: true, data: { id: latestDoc.id, ...latestDoc.data() } };
+        } catch (error) {
+            console.error('讀取最新病人診症記錄失敗:', error);
+            return { success: false, data: null, error: error.message };
+        }
+    }
+
+    async syncPatientConsultationAggregate(patientId) {
+        if (!this.isReady) return { success: false, error: 'not_ready' };
+        const pid = String(patientId || '');
+        if (!pid) return { success: false, error: 'missing_patient_id' };
+
+        try {
+            if (typeof this.ensurePatientConsultationSortDates === 'function') {
+                const backfillResult = await this.ensurePatientConsultationSortDates(pid);
+                if (!backfillResult || !backfillResult.success) {
+                    console.warn('同步診症彙總前補 sortDate 失敗:', backfillResult && backfillResult.error);
+                }
+            }
+
+            await waitForFirebaseDb();
+            const colRef = window.firebase.collection(window.firebase.db, 'consultations');
+            const countQuery = window.firebase.firestoreQuery(
+                colRef,
+                window.firebase.where('patientId', '==', pid)
+            );
+            const countSnap = await window.firebase.getCountFromServer(countQuery);
+            const consultationCount = Number(countSnap && countSnap.data && countSnap.data().count) || 0;
+
+            let latestConsultationAt = null;
+            let latestFollowUpDate = null;
+            if (consultationCount > 0) {
+                const latestQuery = window.firebase.firestoreQuery(
+                    colRef,
+                    window.firebase.where('patientId', '==', pid),
+                    window.firebase.orderBy('sortDate', 'desc'),
+                    window.firebase.limit(1)
+                );
+                const latestSnap = await window.firebase.getDocs(latestQuery);
+                if (latestSnap && latestSnap.docs && latestSnap.docs.length > 0) {
+                    const latestData = latestSnap.docs[0].data() || {};
+                    latestConsultationAt = getConsultationEffectiveDate(latestData) || null;
+                    latestFollowUpDate = parseConsultationDate(latestData.followUpDate) || null;
+                }
+            }
+
+            const aggregatePatch = {
+                consultationCount,
+                latestConsultationAt,
+                latestFollowUpDate
+            };
+
+            await window.firebase.updateDoc(
+                window.firebase.doc(window.firebase.db, 'patients', pid),
+                aggregatePatch
+            );
+            this.applyPatientAggregateToCaches(pid, aggregatePatch);
+
+            return {
+                success: true,
+                consultationCount,
+                latestConsultationAt,
+                latestFollowUpDate
+            };
+        } catch (error) {
+            console.error('同步病人診症彙總失敗:', error);
+            return { success: false, error: error.message };
+        }
     }
 
     async addClinic(clinicData) {
@@ -24417,6 +24684,9 @@ class FirebaseDataManager {
                     ...dataToWrite,
                     searchKeywords: keywords,
                     // 初始化套票彙總欄位，避免未購買套票時為 undefined
+                    consultationCount: 0,
+                    latestConsultationAt: null,
+                    latestFollowUpDate: null,
                     packageActiveCount: 0,
                     packageRemainingUses: 0,
                     createdAt: new Date(),
@@ -24428,6 +24698,8 @@ class FirebaseDataManager {
             console.log('病人數據已添加到 Firebase:', docRef.id);
             // 新增病人後清除緩存並移除本地存檔，讓下一次讀取時重新載入
             this.patientsCache = null;
+            this.patientsCacheSource = 'none';
+            this.patientsCacheFetchedAt = 0;
             try {
                 localStorage.removeItem('patients');
             } catch (_lsErr) {
@@ -24465,6 +24737,8 @@ class FirebaseDataManager {
                         const localData = JSON.parse(stored);
                         if (Array.isArray(localData)) {
                             this.patientsCache = localData;
+                            this.patientsCacheSource = 'localStorage';
+                            this.patientsCacheFetchedAt = Date.now();
                             return { success: true, data: this.patientsCache };
                         }
                     }
@@ -24481,6 +24755,8 @@ class FirebaseDataManager {
             });
             // 將結果寫入快取與 localStorage
             this.patientsCache = patients;
+            this.patientsCacheSource = 'remote';
+            this.patientsCacheFetchedAt = Date.now();
             try {
                 localStorage.setItem('patients', JSON.stringify(patients));
             } catch (lsErr) {
@@ -24520,6 +24796,8 @@ class FirebaseDataManager {
             );
             // 更新病人資料後清除緩存並移除本地存檔，讓下一次讀取時重新載入
             this.patientsCache = null;
+            this.patientsCacheSource = 'none';
+            this.patientsCacheFetchedAt = 0;
             try {
                 localStorage.removeItem('patients');
             } catch (_lsErr) {
@@ -24539,6 +24817,8 @@ class FirebaseDataManager {
             );
             // 刪除病人後清除緩存並移除本地存檔
             this.patientsCache = null;
+            this.patientsCacheSource = 'none';
+            this.patientsCacheFetchedAt = 0;
             try {
                 localStorage.removeItem('patients');
             } catch (_lsErr) {
@@ -24598,13 +24878,17 @@ class FirebaseDataManager {
              */
             let localPatients = [];
             try {
-                // 如果 patientsCache 尚未載入，主動讀取全體病人列表以利搜尋
-                if (!Array.isArray(this.patientsCache)) {
-                    const patientRes = await this.getPatients();
+                // 搜尋時若只有 localStorage 快取，先同步一次遠端清單，避免舊資料漏搜。
+                const shouldRefreshPatients =
+                    !Array.isArray(this.patientsCache)
+                    || this.patientsCacheSource !== 'remote';
+                if (shouldRefreshPatients) {
+                    const patientRes = await this.getPatients(true);
                     if (patientRes && patientRes.success && Array.isArray(patientRes.data)) {
                         localPatients = patientRes.data;
-                        // 更新快取以供下次使用
                         this.patientsCache = patientRes.data;
+                        this.patientsCacheSource = 'remote';
+                        this.patientsCacheFetchedAt = Date.now();
                     }
                 } else {
                     localPatients = this.patientsCache;
@@ -24676,6 +24960,11 @@ class FirebaseDataManager {
                 });
             } catch (_summaryErr) {
                 console.warn('新增診症後同步財務摘要失敗:', _summaryErr);
+            }
+            try {
+                await this.syncPatientConsultationAggregate(consultationData && consultationData.patientId);
+            } catch (_aggregateErr) {
+                console.warn('新增診症後同步病人診症彙總失敗:', _aggregateErr);
             }
             
             console.log('診症記錄已添加到 Firebase:', docRef.id);
@@ -25507,6 +25796,18 @@ class FirebaseDataManager {
             } catch (_summaryErr) {
                 console.warn('更新診症後同步財務摘要失敗:', _summaryErr);
             }
+            try {
+                const aggregatePatientIds = Array.from(new Set(
+                    [existingRecord && existingRecord.patientId, consultationData && consultationData.patientId]
+                        .filter((id) => String(id || '').trim() !== '')
+                        .map((id) => String(id))
+                ));
+                for (const pid of aggregatePatientIds) {
+                    await this.syncPatientConsultationAggregate(pid);
+                }
+            } catch (_aggregateErr) {
+                console.warn('更新診症後同步病人診症彙總失敗:', _aggregateErr);
+            }
             // 更新診症後清除全域診症快取並移除本地存檔
             this.consultationsCache = null;
             try {
@@ -25516,15 +25817,21 @@ class FirebaseDataManager {
             }
             // 更新單一病人診症快取或清除全部快取
             try {
-                if (consultationData && consultationData.patientId) {
-                    delete patientConsultationsCache[consultationData.patientId];
-                    try { localStorage.removeItem('patientConsultations:' + String(consultationData.patientId)); } catch (_e) {}
-                    try {
-                        const pid = String(consultationData.patientId || '');
-                        if (pid && consultationHistoryPager && consultationHistoryPager.patientPagedCache) {
-                            delete consultationHistoryPager.patientPagedCache[pid];
-                        }
-                    } catch (_e2) {}
+                const affectedPatientIds = Array.from(new Set(
+                    [existingRecord && existingRecord.patientId, consultationData && consultationData.patientId]
+                        .filter((id) => String(id || '').trim() !== '')
+                        .map((id) => String(id))
+                ));
+                if (affectedPatientIds.length > 0) {
+                    affectedPatientIds.forEach((pid) => {
+                        delete patientConsultationsCache[pid];
+                        try { localStorage.removeItem('patientConsultations:' + pid); } catch (_e) {}
+                        try {
+                            if (consultationHistoryPager && consultationHistoryPager.patientPagedCache) {
+                                delete consultationHistoryPager.patientPagedCache[pid];
+                            }
+                        } catch (_e2) {}
+                    });
                 } else {
                     // 如果無法確定病人 ID，則清除所有病人診症快取
                     patientConsultationsCache = {};
@@ -25573,10 +25880,41 @@ class FirebaseDataManager {
             } catch (_summaryErr) {
                 console.warn('刪除診症後同步財務摘要失敗:', _summaryErr);
             }
+            try {
+                await this.syncPatientConsultationAggregate(existingRecord && existingRecord.patientId);
+            } catch (_aggregateErr) {
+                console.warn('刪除診症後同步病人診症彙總失敗:', _aggregateErr);
+            }
             this.consultationsCache = null;
             try {
                 localStorage.removeItem('consultations');
             } catch (_lsErr) {}
+            try {
+                const pid = String(existingRecord && existingRecord.patientId || '');
+                if (pid) {
+                    delete patientConsultationsCache[pid];
+                    try { localStorage.removeItem('patientConsultations:' + pid); } catch (_e) {}
+                    try {
+                        if (consultationHistoryPager && consultationHistoryPager.patientPagedCache) {
+                            delete consultationHistoryPager.patientPagedCache[pid];
+                        }
+                    } catch (_e2) {}
+                } else {
+                    patientConsultationsCache = {};
+                    try {
+                        if (consultationHistoryPager && consultationHistoryPager.patientPagedCache) {
+                            consultationHistoryPager.patientPagedCache = {};
+                        }
+                    } catch (_e3) {}
+                }
+            } catch (_cacheErr) {
+                patientConsultationsCache = {};
+                try {
+                    if (consultationHistoryPager && consultationHistoryPager.patientPagedCache) {
+                        consultationHistoryPager.patientPagedCache = {};
+                    }
+                } catch (_e4) {}
+            }
             return { success: true };
         } catch (error) {
             console.error('刪除診症記錄失敗:', error);
@@ -29419,6 +29757,7 @@ function _oldSelectPrescriptionTemplate(id) {
       } catch (fuErr) {
         console.warn('解析複診日期失敗：', fuErr);
       }
+      queueConsultationSymptomsDraftSave();
       hidePrescriptionTemplateModal();
       showToast('已載入醫囑模板', 'success');
     } catch (err) {
@@ -29576,6 +29915,11 @@ function _oldSelectPrescriptionTemplate(id) {
               if (Number.isNaN(parsed)) return fallback;
               return Math.min(max, Math.max(min, parsed));
             };
+            const getNonEmptyString = function(value, fallback) {
+              if (typeof value !== 'string') return fallback;
+              const trimmed = value.trim();
+              return trimmed !== '' ? trimmed : fallback;
+            };
             const followUpTime = typeof source.defaultFollowUpTime === 'string' && /^\d{2}:\d{2}$/.test(source.defaultFollowUpTime.trim())
               ? source.defaultFollowUpTime.trim()
               : defaults.defaultFollowUpTime;
@@ -29589,9 +29933,9 @@ function _oldSelectPrescriptionTemplate(id) {
               defaultPrescriptionFrequency: parseIntWithBounds(source.defaultPrescriptionFrequency, defaults.defaultPrescriptionFrequency, 1, 10),
               defaultFollowUpOffsetDays: parseIntWithBounds(source.defaultFollowUpOffsetDays, defaults.defaultFollowUpOffsetDays, 0, 365),
               defaultFollowUpTime: followUpTime,
-              defaultUsage: typeof source.defaultUsage === 'string' ? source.defaultUsage : defaults.defaultUsage,
-              defaultTreatmentCourse: typeof source.defaultTreatmentCourse === 'string' ? source.defaultTreatmentCourse : defaults.defaultTreatmentCourse,
-              defaultInstructions: typeof source.defaultInstructions === 'string' ? source.defaultInstructions : defaults.defaultInstructions,
+              defaultUsage: getNonEmptyString(source.defaultUsage, defaults.defaultUsage),
+              defaultTreatmentCourse: getNonEmptyString(source.defaultTreatmentCourse, defaults.defaultTreatmentCourse),
+              defaultInstructions: getNonEmptyString(source.defaultInstructions, defaults.defaultInstructions),
               defaultBillingItemIds: billingIds
             };
           }
@@ -30980,12 +31324,11 @@ async function deleteAcupointCombination(id) {
                 if (!ing || !ing.name) return;
                 const item = herbLibrary.find(h => h.name === ing.name);
                 if (item) {
-                  addToPrescription(item.type, item.id);
+                  const addedItem = addToPrescription(item.type, item.id);
                   try {
-                    const lastIndex = selectedPrescriptionItems.length - 1;
-                    if (lastIndex >= 0 && ing.dosage) {
+                    if (addedItem && ing.dosage) {
                       const numeric = String(ing.dosage).match(/[0-9.]+/);
-                      selectedPrescriptionItems[lastIndex].customDosage = numeric ? numeric[0] : selectedPrescriptionItems[lastIndex].customDosage;
+                      addedItem.customDosage = numeric ? numeric[0] : addedItem.customDosage;
                     }
                   } catch (_e) {}
                 } else {
@@ -31160,6 +31503,7 @@ async function deleteAcupointCombination(id) {
                     }
                     notesEl.appendChild(document.createTextNode(prefix + combo.technique));
                   }
+                  queueConsultationSymptomsDraftSave();
                 } catch (_e) {
                   // fallback：若 addAcupointToNotes 執行失敗，則直接將文字插入
                   let noteStr = '';
@@ -31171,6 +31515,7 @@ async function deleteAcupointCombination(id) {
                     noteStr += '針法：' + combo.technique;
                   }
                   notesEl.innerText = noteStr;
+                  queueConsultationSymptomsDraftSave();
                 }
               }
               showToast('已載入常用穴位組合：' + combo.name, 'success');
@@ -32397,6 +32742,19 @@ ${item.points.map(pt => {
           function addHerbToCombo(name, dosage) {
             const container = document.getElementById('herbIngredients');
             if (!container) return;
+            const normalizedName = String(name || '').trim();
+            const isDuplicate = Array.from(container.children).some(row => {
+              const existingName = String(
+                (row.dataset && row.dataset.herbName) ||
+                (row.querySelector('span') ? row.querySelector('span').textContent : '') ||
+                ''
+              ).trim();
+              return existingName !== '' && existingName === normalizedName;
+            });
+            if (isDuplicate) {
+              showToast(`${normalizedName} 已經在此藥方中！`, 'warning');
+              return;
+            }
             // 建立新的一行，並使用綠色背景與邊框樣式
             const div = document.createElement('div');
             div.className = 'flex items-center gap-2 p-2 bg-green-50 hover:bg-green-100 border border-green-200 rounded';
@@ -32427,7 +32785,7 @@ ${item.points.map(pt => {
             // 劑量輸入欄
             const dosageInput = document.createElement('input');
             dosageInput.type = 'number';
-            dosageInput.value = '';
+            dosageInput.value = dosage || '';
             dosageInput.placeholder = '';
             dosageInput.className = 'w-20 px-2 py-1 border border-gray-300 rounded';
             div.appendChild(dosageInput);
@@ -32965,6 +33323,7 @@ if (typeof window !== 'undefined' && !window.removeParentElement) {
           parent.removeChild(span);
         }
         if (typeof hideTooltip === 'function') hideTooltip();
+        queueConsultationSymptomsDraftSave();
       });
       // 在處理插入前，紀錄當前滾動位置，以便插入後恢復滾動位置
       const scrollXBefore = window.pageXOffset || document.documentElement.scrollLeft || 0;
@@ -33035,6 +33394,7 @@ if (typeof window !== 'undefined' && !window.removeParentElement) {
         // 若瀏覽器不支援 scrollTo 的選項寫法，回退到簡單調用
         window.scrollTo(scrollXBefore, scrollYBefore);
       }
+      queueConsultationSymptomsDraftSave();
     } catch (err) {
       console.error('新增穴位到針灸備註時發生錯誤：', err);
     }
