@@ -685,6 +685,23 @@ function hasActionPermission(actionKey) {
   return !!(settings && settings.actions && settings.actions[actionKey]);
 }
 
+function hasAdminRole(user = currentUserData) {
+  const position = user && user.position ? String(user.position).trim() : '';
+  const claims = (typeof window !== 'undefined' && window.currentUserClaims && typeof window.currentUserClaims === 'object')
+    ? window.currentUserClaims
+    : {};
+  const claimRole = claims.role ? String(claims.role).trim().toLowerCase() : '';
+  return !!(
+    claims.admin === true ||
+    claimRole === 'admin' ||
+    position === '診所管理'
+  );
+}
+
+window.isAdminUser = function(user = currentUserData) {
+  return hasAdminRole(user);
+};
+
 function updatePermissionControlledButtonsVisibility() {
   const addPatientBtn = document.getElementById('showAddPatientButton');
   if (addPatientBtn) {
@@ -709,23 +726,7 @@ function hasAccessToSection(sectionId) {
   
   
   if (sectionId === 'userManagement') {
-    try {
-      if (typeof window.isAdminUser === 'function') {
-        
-        return window.isAdminUser();
-      }
-    } catch (_e) {
-      
-    }
-    
-    const email = (currentUserData && currentUserData.email
-      ? String(currentUserData.email).toLowerCase().trim()
-      : '');
-    return (
-      pos === '診所管理' ||
-      (pos && pos.includes('管理')) ||
-      email === 'admin@clinic.com'
-    );
+    return hasAdminRole(currentUserData);
   }
 
   
@@ -2475,6 +2476,12 @@ async function fetchUsers(forceRefresh = false) {
                     addBtn.dataset.bound = 'true';
                 }
             } catch (_e4) {}
+            try {
+                const userClinicSel = document.getElementById('userClinicId');
+                if (userClinicSel) {
+                    populateUserClinicOptions(userClinicSel.value || currentClinicId || 'local-default');
+                }
+            } catch (_eUserClinic) {}
             try {
                 const delBtn = document.getElementById('systemDeleteClinicButton');
                 if (delBtn && !delBtn.dataset.bound) {
@@ -5176,6 +5183,28 @@ function loadUsersFromLocalStorage() {
     }
 }
 
+function normalizeUserForClient(user = {}) {
+    const { personalSettings, ...rest } = user || {};
+    return {
+        ...rest,
+        createdAt: user.createdAt
+          ? (user.createdAt.seconds
+            ? new Date(user.createdAt.seconds * 1000).toISOString()
+            : user.createdAt)
+          : new Date().toISOString(),
+        updatedAt: user.updatedAt
+          ? (user.updatedAt.seconds
+            ? new Date(user.updatedAt.seconds * 1000).toISOString()
+            : user.updatedAt)
+          : new Date().toISOString(),
+        lastLogin: user.lastLogin
+          ? (user.lastLogin.seconds
+            ? new Date(user.lastLogin.seconds * 1000).toISOString()
+            : user.lastLogin)
+          : null
+    };
+}
+
 async function waitForFirebase() {
   while (!window.firebase) {
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -5497,7 +5526,7 @@ async function fetchJsonWithFallback(fileName) {
 
 async function attemptMainLogin() {
     const email = document.getElementById('mainLoginUsername').value.trim();
-    const password = document.getElementById('mainLoginPassword').value.trim();
+    const password = document.getElementById('mainLoginPassword').value;
     
     if (!email || !password) {
         showToast('請輸入電子郵件和密碼！', 'error');
@@ -5553,56 +5582,20 @@ async function attemptMainLogin() {
             window.currentUserClaims = {};
         }
 
-        
-        await syncUserDataFromFirebase();
-
-        
-        let matchingUser = users.find(u => u.uid && u.uid === uid);
-        if (!matchingUser) {
-            
-            matchingUser = users.find(u => u.email && u.email.toLowerCase() === firebaseUser.email.toLowerCase());
-            if (matchingUser) {
-                
-                matchingUser.uid = uid;
-                
-                
-                try {
-                    await waitForFirebaseDataManager(8000);
-                    if (window.firebaseDataManager && typeof window.firebaseDataManager.updateUser === 'function') {
-                        await window.firebaseDataManager.updateUser(matchingUser.id, { uid: uid });
-                    }
-                } catch (error) {
-                    console.error('更新用戶 UID 失敗:', error);
+        let matchingUser = await fetchAuthorizedUserByUidOrEmail(uid, firebaseUser && firebaseUser.email);
+        if (matchingUser && uid && (!matchingUser.uid || matchingUser.uid !== uid)) {
+            matchingUser.uid = uid;
+            try {
+                await waitForFirebaseDataManager(8000);
+                if (window.firebaseDataManager && typeof window.firebaseDataManager.updateUser === 'function') {
+                    await window.firebaseDataManager.updateUser(matchingUser.id, { uid: uid });
                 }
-                
-                
-                localStorage.setItem('users', JSON.stringify(users));
+            } catch (error) {
+                console.error('更新用戶 UID 失敗:', error);
             }
         }
-
-        if (!matchingUser) {
-            const remoteUser = await fetchAuthorizedUserByUidOrEmail(uid, firebaseUser && firebaseUser.email);
-            if (remoteUser) {
-                matchingUser = remoteUser;
-                if (uid && (!matchingUser.uid || matchingUser.uid !== uid)) {
-                    matchingUser.uid = uid;
-                    try {
-                        await waitForFirebaseDataManager(8000);
-                        if (window.firebaseDataManager && typeof window.firebaseDataManager.updateUser === 'function') {
-                            await window.firebaseDataManager.updateUser(matchingUser.id, { uid: uid });
-                        }
-                    } catch (error) {
-                        console.error('更新用戶 UID 失敗:', error);
-                    }
-                }
-                try {
-                    if (!Array.isArray(users)) users = [];
-                    const idx = users.findIndex(u => u && u.id === matchingUser.id);
-                    if (idx >= 0) users[idx] = { ...users[idx], ...matchingUser };
-                    else users.push(matchingUser);
-                    localStorage.setItem('users', JSON.stringify(users));
-                } catch (_e) {}
-            }
+        if (matchingUser) {
+            matchingUser = normalizeUserForClient(matchingUser);
         }
 
         if (matchingUser) {
@@ -5626,6 +5619,18 @@ async function attemptMainLogin() {
             
             currentUserData = matchingUser;
             currentUser = matchingUser.username;
+            try {
+                await syncUserDataFromFirebase({ allowLocalFallback: false });
+            } catch (syncErr) {
+                console.warn('登入後同步用戶資料失敗，保留目前授權用戶資料:', syncErr);
+            }
+            try {
+                if (!Array.isArray(users)) users = [];
+                const idx = users.findIndex(u => u && u.id === matchingUser.id);
+                if (idx >= 0) users[idx] = { ...users[idx], ...matchingUser };
+                else users.push(matchingUser);
+                localStorage.setItem('users', JSON.stringify(users));
+            } catch (_e) {}
         } else {
             
             showToast('此帳號尚未被授權，請聯繫系統管理員', 'error');
@@ -5752,17 +5757,22 @@ async function attemptMainLogin() {
 }
 
 
-async function syncUserDataFromFirebase() {
+async function syncUserDataFromFirebase(options = {}) {
     try {
-        const localFallback = loadUsersFromLocalStorage();
-        if (Array.isArray(localFallback) && localFallback.length && (!Array.isArray(users) || users.length === 0)) {
+        const allowLocalFallback = options.allowLocalFallback !== false;
+        const localFallback = allowLocalFallback ? loadUsersFromLocalStorage() : [];
+        if (allowLocalFallback && Array.isArray(localFallback) && localFallback.length && (!Array.isArray(users) || users.length === 0)) {
             users = localFallback;
         }
 
         if (!window.firebaseDataManager || !window.firebaseDataManager.isReady) {
             const ok = await waitForFirebaseDataManager(8000);
             if (!ok) {
-                console.log('Firebase 數據管理器尚未準備就緒，使用本地用戶快取');
+                if (allowLocalFallback) {
+                    console.log('Firebase 數據管理器尚未準備就緒，使用本地用戶快取');
+                } else {
+                    console.warn('Firebase 數據管理器尚未準備就緒，略過本次用戶同步');
+                }
                 return;
             }
         }
@@ -5771,27 +5781,7 @@ async function syncUserDataFromFirebase() {
         const data = await fetchUsers(true);
         if (Array.isArray(data) && data.length > 0) {
             
-            users = data.map(user => {
-                const { personalSettings, ...rest } = user || {};
-                return {
-                    ...rest,
-                    createdAt: user.createdAt
-                      ? (user.createdAt.seconds
-                        ? new Date(user.createdAt.seconds * 1000).toISOString()
-                        : user.createdAt)
-                      : new Date().toISOString(),
-                    updatedAt: user.updatedAt
-                      ? (user.updatedAt.seconds
-                        ? new Date(user.updatedAt.seconds * 1000).toISOString()
-                        : user.updatedAt)
-                      : new Date().toISOString(),
-                    lastLogin: user.lastLogin
-                      ? (user.lastLogin.seconds
-                        ? new Date(user.lastLogin.seconds * 1000).toISOString()
-                        : user.lastLogin)
-                      : null
-                };
-            });
+            users = data.map(user => normalizeUserForClient(user));
             
             try {
                 localStorage.setItem('users', JSON.stringify(users));
@@ -5801,10 +5791,14 @@ async function syncUserDataFromFirebase() {
             console.log('已同步 Firebase 用戶數據到本地:', users.length, '筆 (使用快取)');
         } else {
             
-            if (Array.isArray(localFallback) && localFallback.length && (!Array.isArray(users) || users.length === 0)) {
+            if (allowLocalFallback && Array.isArray(localFallback) && localFallback.length && (!Array.isArray(users) || users.length === 0)) {
                 users = localFallback;
             }
-            console.warn('無法從 Firebase 取得完整用戶列表，改使用本地快取:', Array.isArray(users) ? users.length : 0, '筆');
+            if (allowLocalFallback) {
+                console.warn('無法從 Firebase 取得完整用戶列表，改使用本地快取:', Array.isArray(users) ? users.length : 0, '筆');
+            } else {
+                console.warn('無法從 Firebase 取得完整用戶列表，保留目前記憶體中的用戶資料');
+            }
         }
     } catch (error) {
         console.error('同步 Firebase 用戶數據失敗:', error);
@@ -20600,6 +20594,8 @@ function showAddUserForm() {
         saveBtnTextEl.textContent = '儲存';
     }
     clearUserForm();
+    populateUserClinicOptions(currentClinicId || 'local-default');
+    setUserEmailFieldEditable(true);
     const modalEl = document.getElementById('addUserModal');
     if (modalEl) {
         modalEl.classList.remove('hidden');
@@ -20609,11 +20605,6 @@ function showAddUserForm() {
         const pwdField = document.getElementById('passwordFields');
         if (pwdField) {
             pwdField.classList.remove('hidden');
-        }
-        // 新增用戶時隱藏 UID 欄位
-        const uidFieldEl = document.getElementById('uidField');
-        if (uidFieldEl) {
-            uidFieldEl.classList.add('hidden');
         }
     } catch (_e) {}
 }
@@ -20625,14 +20616,58 @@ function hideAddUserForm() {
 }
 
 function clearUserForm() {
-    ['userDisplayName', 'userPosition', 'userEmail', 'userPhone', 'userRegistrationNumber', 'userUID', 'userPassword', 'userPasswordConfirm'].forEach(id => {
+    ['userDisplayName', 'userPosition', 'userEmail', 'userPhone', 'userRegistrationNumber', 'userPassword', 'userPasswordConfirm'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.value = '';
     });
     document.getElementById('userActive').checked = true;
+    populateUserClinicOptions(currentClinicId || 'local-default');
+    setUserEmailFieldEditable(true);
     
     // 隱藏註冊編號欄位
     document.getElementById('registrationNumberField').classList.add('hidden');
+}
+
+function setUserEmailFieldEditable(isEditable, lockedEmail = '') {
+    const emailEl = document.getElementById('userEmail');
+    const hintEl = document.getElementById('userEmailHint');
+    if (emailEl) {
+        emailEl.readOnly = !isEditable;
+        emailEl.classList.toggle('bg-gray-100', !isEditable);
+        emailEl.classList.toggle('cursor-not-allowed', !isEditable);
+    }
+    if (hintEl) {
+        hintEl.textContent = isEditable
+            ? '新增用戶時設定登入電子郵件；建立後請透過帳號遷移流程調整。'
+            : `此用戶的登入電子郵件目前不可在此直接修改${lockedEmail ? `：${lockedEmail}` : ''}`;
+    }
+}
+
+function populateUserClinicOptions(selectedClinicId = '') {
+    const clinicSelect = document.getElementById('userClinicId');
+    if (!clinicSelect) return;
+    const preferredClinicId = selectedClinicId
+        || clinicSelect.value
+        || (currentClinicId ? String(currentClinicId) : '')
+        || 'local-default';
+    clinicSelect.innerHTML = '';
+    const clinicItems = Array.isArray(clinicsList) && clinicsList.length
+        ? clinicsList
+        : [{
+            id: 'local-default',
+            chineseName: '預設診所',
+            englishName: 'Default Clinic'
+        }];
+    clinicItems.forEach(clinic => {
+        if (!clinic || clinic.id === undefined || clinic.id === null) return;
+        const option = document.createElement('option');
+        option.value = String(clinic.id);
+        option.textContent = getClinicDisplayName(clinic);
+        clinicSelect.appendChild(option);
+    });
+    const hasPreferred = clinicItems.some(clinic => clinic && String(clinic.id) === String(preferredClinicId));
+    if (hasPreferred) clinicSelect.value = String(preferredClinicId);
+    else if (clinicItems[0] && clinicItems[0].id !== undefined && clinicItems[0].id !== null) clinicSelect.value = String(clinicItems[0].id);
 }
 
 // 切換註冊編號欄位顯示
@@ -20683,16 +20718,14 @@ async function editUser(id) {
     if (positionEl) positionEl.value = user.position || '';
     const emailEl = document.getElementById('userEmail');
     if (emailEl) emailEl.value = user.email || '';
+    setUserEmailFieldEditable(false, user.email || '');
+    populateUserClinicOptions(getClinicIdForUser(user, currentClinicId || 'local-default'));
     const phoneEl = document.getElementById('userPhone');
     if (phoneEl) phoneEl.value = user.phone || '';
     const regNumEl = document.getElementById('userRegistrationNumber');
     if (regNumEl) regNumEl.value = user.registrationNumber || '';
     const activeEl = document.getElementById('userActive');
     if (activeEl) activeEl.checked = user.active !== false;
-
-    // 填入 Firebase UID
-    const uidEl = document.getElementById('userUID');
-    if (uidEl) uidEl.value = user.uid || '';
     
     // 根據職位顯示或隱藏註冊編號欄位
     toggleRegistrationNumberField();
@@ -20702,11 +20735,6 @@ async function editUser(id) {
         const pwdField = document.getElementById('passwordFields');
         if (pwdField) {
             pwdField.classList.add('hidden');
-        }
-        // 編輯用戶時顯示 UID 欄位
-        const uidFieldEl = document.getElementById('uidField');
-        if (uidFieldEl) {
-            uidFieldEl.classList.remove('hidden');
         }
     } catch (_e) {}
     
@@ -20728,7 +20756,10 @@ async function saveUser() {
     const phone = document.getElementById('userPhone').value.trim();
     const registrationNumber = document.getElementById('userRegistrationNumber').value.trim();
     const active = document.getElementById('userActive').checked;
-    const uid = document.getElementById('userUID').value.trim();
+    const userClinicEl = document.getElementById('userClinicId');
+    const selectedClinicId = userClinicEl && userClinicEl.value
+        ? String(userClinicEl.value)
+        : (currentClinicId ? String(currentClinicId) : 'local-default');
 
     // 取得密碼與確認密碼（可能不存在於編輯模式）
     const password = document.getElementById('userPassword') ? document.getElementById('userPassword').value : '';
@@ -20736,9 +20767,7 @@ async function saveUser() {
 
     // 產生內部用戶識別名稱（username）
     let username;
-    if (uid) {
-        username = uid;
-    } else if (email) {
+    if (email) {
         username = email.split('@')[0];
     } else {
         username = 'user_' + Date.now();
@@ -20753,6 +20782,10 @@ async function saveUser() {
     // 驗證必填欄位（姓名與職位）
     if (!name || !position) {
         showToast('請填寫必要資料（姓名、職位）！', 'error');
+        return;
+    }
+    if (!selectedClinicId) {
+        showToast('請選擇主要診所！', 'error');
         return;
     }
 
@@ -20812,15 +20845,7 @@ async function saveUser() {
     }
 
     const currentUsersForLimit = usersFromFirebase.length > 0 ? usersFromFirebase : users;
-    const clinicIdForLimit = (() => {
-        if (editingUserId) {
-            const existing = currentUsersForLimit.find(u => u && String(u.id) === String(editingUserId));
-            if (existing && existing.clinicId !== undefined && existing.clinicId !== null && String(existing.clinicId)) {
-                return String(existing.clinicId);
-            }
-        }
-        return currentClinicId ? String(currentClinicId) : 'local-default';
-    })();
+    const clinicIdForLimit = selectedClinicId;
     const limitCheck = canActivateUserUnderClinicLimit({
         users: currentUsersForLimit,
         clinicId: clinicIdForLimit,
@@ -20841,14 +20866,23 @@ async function saveUser() {
     try {
         if (editingUserId) {
             const existingUserRecord = (usersFromFirebase.length > 0 ? usersFromFirebase : users).find(u => u && String(u.id) === String(editingUserId));
+            if (!existingUserRecord) {
+                showToast('找不到要更新的用戶資料！', 'error');
+                return;
+            }
+            const lockedEmail = (existingUserRecord.email || '').trim();
+            if (String(email) !== String(lockedEmail)) {
+                showToast('登入電子郵件目前不可在此直接修改，請維持原值。', 'error');
+                return;
+            }
             // 更新現有用戶
             const userData = {
                 name: name,
                 position: position,
                 registrationNumber: position === '醫師' ? registrationNumber : null,
-                email: email,
+                email: lockedEmail,
                 phone: phone,
-                uid: uid || '',
+                uid: existingUserRecord.uid || '',
                 active: active,
                 clinicId: clinicIdForLimit,
                 permissionSettings: (existingUserRecord && existingUserRecord.permissionSettings) ? existingUserRecord.permissionSettings : undefined
@@ -20886,8 +20920,7 @@ async function saveUser() {
             }
         } else {
             // 新增用戶
-            // 若輸入了電子郵件且沒有輸入 UID，使用 Firebase Authentication 建立新帳戶
-            // 新增用戶一律透過 Firebase Auth 建立帳號，忽略手動輸入的 UID
+            // 新增用戶一律透過 Firebase Auth 建立帳號
             let newUid = '';
             if (email) {
                 // 驗證密碼與確認密碼
@@ -21561,6 +21594,281 @@ async function deleteUser(id) {
                 syncedAt: now,
                 isDeleted
             };
+        }
+
+        const PERSONAL_STATS_SUMMARY_VERSION = 1;
+        const PERSONAL_STATS_SUMMARY_COLLECTION = 'personalStatisticsMonthlySummaries';
+        const PERSONAL_STATS_SUMMARY_STATE_COLLECTION = 'personalStatisticsSummaryStates';
+
+        function normalizePersonalStatsString(value) {
+            if (value === undefined || value === null) return '';
+            try {
+                return String(value).trim();
+            } catch (_e) {
+                return '';
+            }
+        }
+
+        function getPersonalStatsMonthKey(value) {
+            const parsed = parseConsultationDate(value);
+            if (!parsed || isNaN(parsed.getTime())) return '';
+            const year = parsed.getFullYear();
+            const month = String(parsed.getMonth() + 1).padStart(2, '0');
+            return `${year}-${month}`;
+        }
+
+        function getPersonalStatsClinicIdentity(source) {
+            const clinicId = source && source.clinicId !== undefined && source.clinicId !== null
+                ? normalizePersonalStatsString(source.clinicId)
+                : '';
+            const clinicName = normalizePersonalStatsString(source && source.clinicName ? source.clinicName : '');
+            const clinicKey = clinicId || (clinicName ? `name:${clinicName}` : 'no-clinic');
+            return {
+                clinicId: clinicId || null,
+                clinicName,
+                clinicKey
+            };
+        }
+
+        function getPersonalStatsDocId(ownerId, monthKey, clinicKey) {
+            return [
+                encodeURIComponent(normalizePersonalStatsString(ownerId)),
+                encodeURIComponent(normalizePersonalStatsString(monthKey)),
+                encodeURIComponent(normalizePersonalStatsString(clinicKey))
+            ].join('__');
+        }
+
+        function isPersonalStatsFormulaName(name) {
+            const needle = normalizePersonalStatsString(name);
+            if (!needle || !Array.isArray(herbLibrary)) return false;
+            const match = herbLibrary.find((item) => item && item.name === needle);
+            return !!(match && match.type === 'formula');
+        }
+
+        function parsePersonalStatsPrescriptionCounts(prescriptionText) {
+            const herbCounts = {};
+            const formulaCounts = {};
+            const raw = normalizePersonalStatsString(prescriptionText);
+            if (!raw) return { herbCounts, formulaCounts };
+            const lines = raw.split('\n');
+            for (const originalLine of lines) {
+                const line = normalizePersonalStatsString(originalLine);
+                if (!line) continue;
+                const matched = line.match(/^([^0-9\s\(\)\.]+)/);
+                const name = matched ? normalizePersonalStatsString(matched[1]) : normalizePersonalStatsString(line.split(/[\d\s]/)[0]);
+                if (!name) continue;
+                if (isPersonalStatsFormulaName(name)) {
+                    formulaCounts[name] = (formulaCounts[name] || 0) + 1;
+                } else {
+                    herbCounts[name] = (herbCounts[name] || 0) + 1;
+                }
+            }
+            return { herbCounts, formulaCounts };
+        }
+
+        function parsePersonalStatsAcupointCounts(acupunctureNotes) {
+            const acupointCounts = {};
+            const raw = normalizePersonalStatsString(acupunctureNotes);
+            if (!raw) return acupointCounts;
+            const re = /data-acupoint-name="(.*?)"/g;
+            let match;
+            while ((match = re.exec(raw)) !== null) {
+                const name = normalizePersonalStatsString(match[1]);
+                if (!name) continue;
+                acupointCounts[name] = (acupointCounts[name] || 0) + 1;
+            }
+            return acupointCounts;
+        }
+
+        function normalizePersonalStatsCountMap(source) {
+            const normalized = {};
+            if (!source || typeof source !== 'object') return normalized;
+            Object.entries(source).forEach(([name, count]) => {
+                const key = normalizePersonalStatsString(name);
+                const num = Number(count) || 0;
+                if (!key || num <= 0) return;
+                normalized[key] = Math.round(num);
+            });
+            return normalized;
+        }
+
+        function personalStatsEntriesToMap(entries) {
+            const out = {};
+            if (!Array.isArray(entries)) return out;
+            entries.forEach((entry) => {
+                const name = normalizePersonalStatsString(entry && entry.name);
+                const count = Math.round(Number(entry && entry.count) || 0);
+                if (!name || count <= 0) return;
+                out[name] = count;
+            });
+            return out;
+        }
+
+        function personalStatsMapToEntries(map) {
+            return Object.entries(normalizePersonalStatsCountMap(map))
+                .sort((a, b) => {
+                    if (b[1] !== a[1]) return b[1] - a[1];
+                    return a[0].localeCompare(b[0], 'zh-Hant');
+                })
+                .map(([name, count]) => ({ name, count }));
+        }
+
+        function applyPersonalStatsMapDelta(target, deltaMap) {
+            const base = target && typeof target === 'object' ? target : {};
+            Object.entries(deltaMap || {}).forEach(([name, delta]) => {
+                const key = normalizePersonalStatsString(name);
+                if (!key) return;
+                const next = Math.round((Number(base[key]) || 0) + (Number(delta) || 0));
+                if (next > 0) {
+                    base[key] = next;
+                } else {
+                    delete base[key];
+                }
+            });
+            return base;
+        }
+
+        function getPersonalStatsOwnerIds(source) {
+            const owners = new Set();
+            [source && source.doctor, source && source.createdBy].forEach((value) => {
+                const normalized = normalizePersonalStatsString(value);
+                if (normalized) owners.add(normalized);
+            });
+            return Array.from(owners);
+        }
+
+        function buildPersonalStatsContribution(source) {
+            const record = source && typeof source === 'object' ? source : null;
+            if (!record) return null;
+            const status = normalizePersonalStatsString(record.status || 'completed');
+            if (status && status !== 'completed') return null;
+            const monthKey = getPersonalStatsMonthKey(record.date || record.createdAt || record.updatedAt || null);
+            if (!monthKey) return null;
+            const owners = getPersonalStatsOwnerIds(record);
+            if (!owners.length) return null;
+            const { clinicId, clinicName, clinicKey } = getPersonalStatsClinicIdentity(record);
+            const prescriptionCounts = parsePersonalStatsPrescriptionCounts(record.prescription || '');
+            const acupointCounts = parsePersonalStatsAcupointCounts(record.acupunctureNotes || '');
+            return {
+                owners,
+                monthKey,
+                clinicId,
+                clinicName,
+                clinicKey,
+                herbCounts: normalizePersonalStatsCountMap(prescriptionCounts.herbCounts),
+                formulaCounts: normalizePersonalStatsCountMap(prescriptionCounts.formulaCounts),
+                acupointCounts: normalizePersonalStatsCountMap(acupointCounts),
+                totalConsultations: 1
+            };
+        }
+
+        function appendPersonalStatsContribution(bucketMap, contribution, sign = 1) {
+            if (!bucketMap || !contribution) return;
+            const direction = sign >= 0 ? 1 : -1;
+            contribution.owners.forEach((ownerId) => {
+                const docId = getPersonalStatsDocId(ownerId, contribution.monthKey, contribution.clinicKey);
+                if (!bucketMap.has(docId)) {
+                    bucketMap.set(docId, {
+                        docId,
+                        ownerId,
+                        monthKey: contribution.monthKey,
+                        clinicId: contribution.clinicId,
+                        clinicName: contribution.clinicName,
+                        clinicKey: contribution.clinicKey,
+                        herbCounts: {},
+                        formulaCounts: {},
+                        acupointCounts: {},
+                        totalConsultations: 0
+                    });
+                }
+                const bucket = bucketMap.get(docId);
+                Object.entries(contribution.herbCounts || {}).forEach(([name, count]) => {
+                    bucket.herbCounts[name] = (bucket.herbCounts[name] || 0) + (Number(count) || 0) * direction;
+                });
+                Object.entries(contribution.formulaCounts || {}).forEach(([name, count]) => {
+                    bucket.formulaCounts[name] = (bucket.formulaCounts[name] || 0) + (Number(count) || 0) * direction;
+                });
+                Object.entries(contribution.acupointCounts || {}).forEach(([name, count]) => {
+                    bucket.acupointCounts[name] = (bucket.acupointCounts[name] || 0) + (Number(count) || 0) * direction;
+                });
+                bucket.totalConsultations += (Number(contribution.totalConsultations) || 0) * direction;
+            });
+        }
+
+        function buildPersonalStatsMonthlySummaryPayloads(records) {
+            const bucketMap = new Map();
+            (Array.isArray(records) ? records : []).forEach((record) => {
+                const contribution = buildPersonalStatsContribution(record);
+                appendPersonalStatsContribution(bucketMap, contribution, 1);
+            });
+            const now = new Date();
+            return Array.from(bucketMap.values()).map((bucket) => ({
+                docId: bucket.docId,
+                ownerId: bucket.ownerId,
+                monthKey: bucket.monthKey,
+                clinicId: bucket.clinicId,
+                clinicName: bucket.clinicName || '',
+                clinicKey: bucket.clinicKey,
+                totalConsultations: Math.max(0, Math.round(Number(bucket.totalConsultations) || 0)),
+                herbEntries: personalStatsMapToEntries(bucket.herbCounts),
+                formulaEntries: personalStatsMapToEntries(bucket.formulaCounts),
+                acupointEntries: personalStatsMapToEntries(bucket.acupointCounts),
+                summaryVersion: PERSONAL_STATS_SUMMARY_VERSION,
+                syncedAt: now,
+                updatedAt: now
+            }));
+        }
+
+        async function fetchPersonalStatsConsultationsByField(field, value, pageSize = 200) {
+            const list = [];
+            await waitForFirebaseDb();
+            const normalizedValue = normalizePersonalStatsString(value);
+            if (!normalizedValue) return list;
+            const colRef = window.firebase.collection(window.firebase.db, 'consultations');
+            let q = window.firebase.firestoreQuery(
+                colRef,
+                window.firebase.where(field, '==', normalizedValue),
+                window.firebase.orderBy('createdAt', 'asc'),
+                window.firebase.limit(pageSize)
+            );
+            let snap = await window.firebase.getDocs(q);
+            snap.forEach((docSnap) => list.push({ id: docSnap.id, ...docSnap.data() }));
+            let lastVisible = snap.docs.length ? snap.docs[snap.docs.length - 1] : null;
+            while (snap.docs.length === pageSize && lastVisible) {
+                q = window.firebase.firestoreQuery(
+                    colRef,
+                    window.firebase.where(field, '==', normalizedValue),
+                    window.firebase.orderBy('createdAt', 'asc'),
+                    window.firebase.startAfter(lastVisible),
+                    window.firebase.limit(pageSize)
+                );
+                snap = await window.firebase.getDocs(q);
+                snap.forEach((docSnap) => list.push({ id: docSnap.id, ...docSnap.data() }));
+                lastVisible = snap.docs.length ? snap.docs[snap.docs.length - 1] : null;
+            }
+            return list;
+        }
+
+        function clearPersonalStatisticsLocalCache(ownerIds) {
+            const owners = Array.from(new Set((Array.isArray(ownerIds) ? ownerIds : []).map((id) => normalizePersonalStatsString(id)).filter(Boolean)));
+            if (!owners.length) return;
+            ['personalStatsV2', 'personalStatsV3'].forEach((storageKey) => {
+                try {
+                    const raw = localStorage.getItem(storageKey);
+                    if (!raw) return;
+                    const parsed = JSON.parse(raw);
+                    let changed = false;
+                    owners.forEach((ownerId) => {
+                        if (parsed && Object.prototype.hasOwnProperty.call(parsed, ownerId)) {
+                            delete parsed[ownerId];
+                            changed = true;
+                        }
+                    });
+                    if (changed) {
+                        localStorage.setItem(storageKey, JSON.stringify(parsed));
+                    }
+                } catch (_e) {}
+            });
         }
 
         function normalizeFinancialRecordForReport(item) {
@@ -24962,6 +25270,17 @@ class FirebaseDataManager {
                 console.warn('新增診症後同步財務摘要失敗:', _summaryErr);
             }
             try {
+                await this.syncConsultationPersonalStatsSummaries(null, {
+                    id: docRef.id,
+                    ...dataToWrite,
+                    createdAt,
+                    sortDate: sortDate || createdAt,
+                    createdBy: currentUser
+                });
+            } catch (_personalStatsErr) {
+                console.warn('新增診症後同步個人統計摘要失敗:', _personalStatsErr);
+            }
+            try {
                 await this.syncPatientConsultationAggregate(consultationData && consultationData.patientId);
             } catch (_aggregateErr) {
                 console.warn('新增診症後同步病人診症彙總失敗:', _aggregateErr);
@@ -25248,6 +25567,217 @@ class FirebaseDataManager {
         } catch (error) {
             console.error('批次同步財務摘要失敗:', error);
             return { success: false, syncedCount: 0, error: error && error.message ? error.message : String(error) };
+        }
+    }
+
+    async syncConsultationPersonalStatsSummaries(beforeRecord, afterRecord) {
+        if (!this.isReady) return { success: false };
+        try {
+            await waitForFirebaseDb();
+            const beforeContribution = buildPersonalStatsContribution(beforeRecord);
+            const afterContribution = buildPersonalStatsContribution(afterRecord);
+            const bucketChanges = new Map();
+            appendPersonalStatsContribution(bucketChanges, beforeContribution, -1);
+            appendPersonalStatsContribution(bucketChanges, afterContribution, 1);
+            if (bucketChanges.size === 0) {
+                return { success: true, changedCount: 0 };
+            }
+
+            const now = new Date();
+            await window.firebase.runTransaction(window.firebase.db, async (transaction) => {
+                for (const change of bucketChanges.values()) {
+                    const docRef = window.firebase.doc(window.firebase.db, PERSONAL_STATS_SUMMARY_COLLECTION, change.docId);
+                    const snap = await transaction.get(docRef);
+                    const current = snap && snap.exists() ? (snap.data() || {}) : {};
+                    const herbMap = personalStatsEntriesToMap(current.herbEntries);
+                    const formulaMap = personalStatsEntriesToMap(current.formulaEntries);
+                    const acupointMap = personalStatsEntriesToMap(current.acupointEntries);
+
+                    applyPersonalStatsMapDelta(herbMap, change.herbCounts);
+                    applyPersonalStatsMapDelta(formulaMap, change.formulaCounts);
+                    applyPersonalStatsMapDelta(acupointMap, change.acupointCounts);
+
+                    const totalConsultations = Math.max(
+                        0,
+                        Math.round((Number(current.totalConsultations) || 0) + (Number(change.totalConsultations) || 0))
+                    );
+                    const hasEntries = Object.keys(herbMap).length > 0
+                        || Object.keys(formulaMap).length > 0
+                        || Object.keys(acupointMap).length > 0;
+
+                    if (!hasEntries && totalConsultations <= 0) {
+                        if (snap && snap.exists()) {
+                            transaction.delete(docRef);
+                        }
+                        continue;
+                    }
+
+                    transaction.set(docRef, {
+                        ownerId: change.ownerId,
+                        monthKey: change.monthKey,
+                        clinicId: change.clinicId,
+                        clinicName: change.clinicName || '',
+                        clinicKey: change.clinicKey,
+                        totalConsultations,
+                        herbEntries: personalStatsMapToEntries(herbMap),
+                        formulaEntries: personalStatsMapToEntries(formulaMap),
+                        acupointEntries: personalStatsMapToEntries(acupointMap),
+                        summaryVersion: PERSONAL_STATS_SUMMARY_VERSION,
+                        syncedAt: now,
+                        updatedAt: now
+                    }, { merge: true });
+                }
+            });
+
+            const affectedOwners = Array.from(new Set(
+                [...getPersonalStatsOwnerIds(beforeRecord || {}), ...getPersonalStatsOwnerIds(afterRecord || {})]
+            ));
+            for (const ownerId of affectedOwners) {
+                await window.firebase.setDoc(
+                    window.firebase.doc(window.firebase.db, PERSONAL_STATS_SUMMARY_STATE_COLLECTION, ownerId),
+                    {
+                        ownerId,
+                        summaryVersion: PERSONAL_STATS_SUMMARY_VERSION,
+                        initializedAt: now,
+                        updatedAt: now
+                    },
+                    { merge: true }
+                );
+            }
+            clearPersonalStatisticsLocalCache(affectedOwners);
+            return { success: true, changedCount: bucketChanges.size };
+        } catch (error) {
+            console.error('同步個人統計摘要失敗:', error);
+            return { success: false, error: error && error.message ? error.message : String(error) };
+        }
+    }
+
+    async rebuildPersonalStatsSummariesForOwner(ownerId) {
+        if (!this.isReady) return { success: false, data: [] };
+        try {
+            await waitForFirebaseDb();
+            const owner = normalizePersonalStatsString(ownerId);
+            if (!owner) return { success: false, error: 'missing_owner_id', data: [] };
+
+            const allRecords = [];
+            const seen = new Set();
+            const appendRecords = (records) => {
+                (Array.isArray(records) ? records : []).forEach((record) => {
+                    const id = normalizePersonalStatsString(record && record.id);
+                    if (!id || seen.has(id)) return;
+                    seen.add(id);
+                    allRecords.push(record);
+                });
+            };
+
+            appendRecords(await fetchPersonalStatsConsultationsByField('doctor', owner, 200));
+            appendRecords(await fetchPersonalStatsConsultationsByField('createdBy', owner, 200));
+
+            const payloads = buildPersonalStatsMonthlySummaryPayloads(allRecords);
+            const existingSnap = await window.firebase.getDocs(
+                window.firebase.firestoreQuery(
+                    window.firebase.collection(window.firebase.db, PERSONAL_STATS_SUMMARY_COLLECTION),
+                    window.firebase.where('ownerId', '==', owner)
+                )
+            );
+
+            let batch = window.firebase.writeBatch(window.firebase.db);
+            let opCount = 0;
+            const commitBatch = async () => {
+                if (opCount > 0) {
+                    await batch.commit();
+                    batch = window.firebase.writeBatch(window.firebase.db);
+                    opCount = 0;
+                }
+            };
+
+            for (const docSnap of existingSnap.docs || []) {
+                batch.delete(docSnap.ref);
+                opCount += 1;
+                if (opCount >= 400) {
+                    await commitBatch();
+                }
+            }
+
+            for (const payload of payloads) {
+                batch.set(
+                    window.firebase.doc(window.firebase.db, PERSONAL_STATS_SUMMARY_COLLECTION, payload.docId),
+                    payload,
+                    { merge: true }
+                );
+                opCount += 1;
+                if (opCount >= 400) {
+                    await commitBatch();
+                }
+            }
+            await commitBatch();
+
+            const now = new Date();
+            await window.firebase.setDoc(
+                window.firebase.doc(window.firebase.db, PERSONAL_STATS_SUMMARY_STATE_COLLECTION, owner),
+                {
+                    ownerId: owner,
+                    summaryVersion: PERSONAL_STATS_SUMMARY_VERSION,
+                    initializedAt: now,
+                    updatedAt: now,
+                    sourceConsultationCount: allRecords.length,
+                    summaryBucketCount: payloads.length
+                },
+                { merge: true }
+            );
+            clearPersonalStatisticsLocalCache([owner]);
+            return { success: true, data: payloads, rebuilt: true };
+        } catch (error) {
+            console.error('重建個人統計摘要失敗:', error);
+            return { success: false, data: [], error: error && error.message ? error.message : String(error) };
+        }
+    }
+
+    async ensurePersonalStatsSummariesInitialized(ownerId) {
+        if (!this.isReady) return { success: false, data: [] };
+        try {
+            await waitForFirebaseDb();
+            const owner = normalizePersonalStatsString(ownerId);
+            if (!owner) return { success: false, data: [], error: 'missing_owner_id' };
+            const stateRef = window.firebase.doc(window.firebase.db, PERSONAL_STATS_SUMMARY_STATE_COLLECTION, owner);
+            const stateSnap = await window.firebase.getDoc(stateRef);
+            const currentVersion = stateSnap && stateSnap.exists() ? Number((stateSnap.data() || {}).summaryVersion) || 0 : 0;
+            if (currentVersion >= PERSONAL_STATS_SUMMARY_VERSION) {
+                return { success: true, data: [], initialized: true, rebuilt: false };
+            }
+            return await this.rebuildPersonalStatsSummariesForOwner(owner);
+        } catch (error) {
+            console.error('初始化個人統計摘要失敗:', error);
+            return { success: false, data: [], error: error && error.message ? error.message : String(error) };
+        }
+    }
+
+    async getPersonalStatsMonthlySummaries(ownerId) {
+        if (!this.isReady) return { success: false, data: [] };
+        try {
+            await this.ensurePersonalStatsSummariesInitialized(ownerId);
+            const owner = normalizePersonalStatsString(ownerId);
+            if (!owner) return { success: false, data: [], error: 'missing_owner_id' };
+            const snap = await window.firebase.getDocs(
+                window.firebase.firestoreQuery(
+                    window.firebase.collection(window.firebase.db, PERSONAL_STATS_SUMMARY_COLLECTION),
+                    window.firebase.where('ownerId', '==', owner)
+                )
+            );
+            const list = [];
+            snap.forEach((docSnap) => {
+                list.push({ id: docSnap.id, ...docSnap.data() });
+            });
+            list.sort((a, b) => {
+                const aMonth = normalizePersonalStatsString(a && a.monthKey);
+                const bMonth = normalizePersonalStatsString(b && b.monthKey);
+                if (aMonth !== bMonth) return bMonth.localeCompare(aMonth);
+                return normalizePersonalStatsString(a && a.clinicName).localeCompare(normalizePersonalStatsString(b && b.clinicName), 'zh-Hant');
+            });
+            return { success: true, data: list };
+        } catch (error) {
+            console.error('讀取個人統計摘要失敗:', error);
+            return { success: false, data: [], error: error && error.message ? error.message : String(error) };
         }
     }
 
@@ -25797,6 +26327,21 @@ class FirebaseDataManager {
                 console.warn('更新診症後同步財務摘要失敗:', _summaryErr);
             }
             try {
+                await this.syncConsultationPersonalStatsSummaries(
+                    existingRecord ? { id: String(consultationId), ...existingRecord } : null,
+                    {
+                        id: String(consultationId),
+                        ...(existingRecord || {}),
+                        ...dataToWrite,
+                        updatedAt,
+                        sortDate: sortDate || updatedAt,
+                        updatedBy: currentUser
+                    }
+                );
+            } catch (_personalStatsErr) {
+                console.warn('更新診症後同步個人統計摘要失敗:', _personalStatsErr);
+            }
+            try {
                 const aggregatePatientIds = Array.from(new Set(
                     [existingRecord && existingRecord.patientId, consultationData && consultationData.patientId]
                         .filter((id) => String(id || '').trim() !== '')
@@ -25879,6 +26424,14 @@ class FirebaseDataManager {
                 }, { forceDeleted: true });
             } catch (_summaryErr) {
                 console.warn('刪除診症後同步財務摘要失敗:', _summaryErr);
+            }
+            try {
+                await this.syncConsultationPersonalStatsSummaries(
+                    existingRecord ? { ...existingRecord } : null,
+                    null
+                );
+            } catch (_personalStatsErr) {
+                console.warn('刪除診症後同步個人統計摘要失敗:', _personalStatsErr);
             }
             try {
                 await this.syncPatientConsultationAggregate(existingRecord && existingRecord.patientId);
