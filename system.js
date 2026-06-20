@@ -2477,12 +2477,6 @@ async function fetchUsers(forceRefresh = false) {
                 }
             } catch (_e4) {}
             try {
-                const userClinicSel = document.getElementById('userClinicId');
-                if (userClinicSel) {
-                    populateUserClinicOptions(userClinicSel.value || currentClinicId || 'local-default');
-                }
-            } catch (_eUserClinic) {}
-            try {
                 const delBtn = document.getElementById('systemDeleteClinicButton');
                 if (delBtn && !delBtn.dataset.bound) {
                     delBtn.addEventListener('click', async function() {
@@ -6412,6 +6406,62 @@ async function logout() {
             return { history, allergies };
         }
 
+        function mergePatientMedicalProfiles(existingProfile, incomingProfile) {
+            const baseProfile = normalizePatientMedicalProfile(existingProfile);
+            const nextProfile = normalizePatientMedicalProfile(incomingProfile);
+            const mergedProfile = {};
+            PATIENT_MEDICAL_PROFILE_SECTIONS.forEach(section => {
+                const mergedSelected = Array.from(new Set([
+                    ...(baseProfile[section.key] && Array.isArray(baseProfile[section.key].selected) ? baseProfile[section.key].selected : []),
+                    ...(nextProfile[section.key] && Array.isArray(nextProfile[section.key].selected) ? nextProfile[section.key].selected : [])
+                ]));
+                const mergedNotes = [
+                    baseProfile[section.key] ? baseProfile[section.key].note : '',
+                    nextProfile[section.key] ? nextProfile[section.key].note : ''
+                ]
+                    .map(note => String(note || '').trim())
+                    .filter(Boolean);
+                mergedProfile[section.key] = {
+                    selected: mergedSelected,
+                    note: Array.from(new Set(mergedNotes)).join('；')
+                };
+            });
+            return normalizePatientMedicalProfile(mergedProfile);
+        }
+
+        async function syncPatientMedicalProfileFromInquiryData(patientId, inquiryData) {
+            try {
+                const inquiryIsFirstVisit = inquiryData && (inquiryData.firstVisit === true || inquiryData.isFirstVisit === true);
+                if (!patientId || !inquiryData || inquiryIsFirstVisit !== true || !inquiryData.medicalProfile) {
+                    return { success: true, skipped: true };
+                }
+                const normalizedIncomingProfile = normalizePatientMedicalProfile(inquiryData.medicalProfile);
+                if (!hasPatientMedicalProfileContent(normalizedIncomingProfile)) {
+                    return { success: true, skipped: true };
+                }
+                const patient = await getPatientByIdWithRefresh(patientId);
+                if (!patient) {
+                    return { success: false, error: '找不到病人資料' };
+                }
+                const mergedProfile = mergePatientMedicalProfiles(patient.medicalProfile, normalizedIncomingProfile);
+                const medicalProfileSummary = buildPatientMedicalProfileLegacySummary(mergedProfile);
+                const updatePayload = {
+                    medicalProfile: mergedProfile,
+                    history: medicalProfileSummary.history,
+                    allergies: medicalProfileSummary.allergies
+                };
+                const result = await window.firebaseDataManager.updatePatient(patientId, updatePayload);
+                if (!result || !result.success) {
+                    return { success: false, error: result && result.error ? result.error : '更新病人資料失敗' };
+                }
+                invalidatePatientCaches();
+                return { success: true };
+            } catch (error) {
+                console.error('同步預診病史資料失敗:', error);
+                return { success: false, error: error.message };
+            }
+        }
+
         function invalidatePatientCaches() {
             patientCache = null;
             if (typeof patientPagesCache === 'object') {
@@ -7934,6 +7984,7 @@ function generateSymptomSummaryFromInquiry(data) {
 function generateHistorySummaryFromInquiry(data) {
     if (!data) return '';
     const labels = {
+        visitType: '就診類型',
         sweating: '汗出情況',
         '出汗部位': '出汗部位',
         temperature: '寒熱',
@@ -7952,6 +8003,7 @@ function generateHistorySummaryFromInquiry(data) {
         stoolFrequency: '大便頻率',
         stoolOdor: '大便氣味',
         stoolColor: '大便顏色',
+        sleepQuality: '睡眠品質',
         sleep: '睡眠',
         energy: '精神狀態',
         morningEnergy: '晨起精神',
@@ -7964,6 +8016,7 @@ function generateHistorySummaryFromInquiry(data) {
     };
     const lines = [];
     Object.keys(labels).forEach(key => {
+        if (data.medicalProfile && key === 'allergies') return;
         const label = labels[key];
         const value = data[key];
         if (value === undefined || value === null) return;
@@ -7980,6 +8033,19 @@ function generateHistorySummaryFromInquiry(data) {
             lines.push(label + '：' + valStr);
         }
     });
+    if (data.medicalProfile) {
+        try {
+            const medicalProfileSummary = buildPatientMedicalProfileLegacySummary(data.medicalProfile);
+            if (medicalProfileSummary.history) {
+                lines.push('病史資料：' + medicalProfileSummary.history);
+            }
+            if (medicalProfileSummary.allergies) {
+                lines.push('過敏史：' + medicalProfileSummary.allergies);
+            }
+        } catch (error) {
+            console.warn('整理問診病史摘要失敗:', error);
+        }
+    }
     return lines.join('\n');
 }
 
@@ -8701,6 +8767,23 @@ async function selectPatientForRegistration(patientId) {
                 // 更新本地儲存作為備份
                 localStorage.setItem('appointments', JSON.stringify(appointments));
                 if (result.success) {
+                    if (inquiryDataForAppointment) {
+                        try {
+                            const syncResult = await syncPatientMedicalProfileFromInquiryData(selectedPatientForRegistration.id, inquiryDataForAppointment);
+                            if (syncResult && syncResult.success) {
+                                try {
+                                    const refreshedPatient = await getPatientByIdWithRefresh(selectedPatientForRegistration.id);
+                                    if (refreshedPatient) {
+                                        selectedPatientForRegistration = refreshedPatient;
+                                    }
+                                } catch (_refreshErr) {}
+                            } else if (syncResult && !syncResult.skipped) {
+                                console.error('掛號後同步病史資料失敗:', syncResult.error || syncResult);
+                            }
+                        } catch (syncError) {
+                            console.error('掛號後同步病史資料時發生錯誤:', syncError);
+                        }
+                    }
                     {
                         // Show registration success message based on language
                         const lang = localStorage.getItem('lang') || 'zh';
@@ -20594,7 +20677,6 @@ function showAddUserForm() {
         saveBtnTextEl.textContent = '儲存';
     }
     clearUserForm();
-    populateUserClinicOptions(currentClinicId || 'local-default');
     setUserEmailFieldEditable(true);
     const modalEl = document.getElementById('addUserModal');
     if (modalEl) {
@@ -20621,7 +20703,6 @@ function clearUserForm() {
         if (el) el.value = '';
     });
     document.getElementById('userActive').checked = true;
-    populateUserClinicOptions(currentClinicId || 'local-default');
     setUserEmailFieldEditable(true);
     
     // 隱藏註冊編號欄位
@@ -20641,33 +20722,6 @@ function setUserEmailFieldEditable(isEditable, lockedEmail = '') {
             ? '新增用戶時設定登入電子郵件；建立後請透過帳號遷移流程調整。'
             : `此用戶的登入電子郵件目前不可在此直接修改${lockedEmail ? `：${lockedEmail}` : ''}`;
     }
-}
-
-function populateUserClinicOptions(selectedClinicId = '') {
-    const clinicSelect = document.getElementById('userClinicId');
-    if (!clinicSelect) return;
-    const preferredClinicId = selectedClinicId
-        || clinicSelect.value
-        || (currentClinicId ? String(currentClinicId) : '')
-        || 'local-default';
-    clinicSelect.innerHTML = '';
-    const clinicItems = Array.isArray(clinicsList) && clinicsList.length
-        ? clinicsList
-        : [{
-            id: 'local-default',
-            chineseName: '預設診所',
-            englishName: 'Default Clinic'
-        }];
-    clinicItems.forEach(clinic => {
-        if (!clinic || clinic.id === undefined || clinic.id === null) return;
-        const option = document.createElement('option');
-        option.value = String(clinic.id);
-        option.textContent = getClinicDisplayName(clinic);
-        clinicSelect.appendChild(option);
-    });
-    const hasPreferred = clinicItems.some(clinic => clinic && String(clinic.id) === String(preferredClinicId));
-    if (hasPreferred) clinicSelect.value = String(preferredClinicId);
-    else if (clinicItems[0] && clinicItems[0].id !== undefined && clinicItems[0].id !== null) clinicSelect.value = String(clinicItems[0].id);
 }
 
 // 切換註冊編號欄位顯示
@@ -20719,7 +20773,6 @@ async function editUser(id) {
     const emailEl = document.getElementById('userEmail');
     if (emailEl) emailEl.value = user.email || '';
     setUserEmailFieldEditable(false, user.email || '');
-    populateUserClinicOptions(getClinicIdForUser(user, currentClinicId || 'local-default'));
     const phoneEl = document.getElementById('userPhone');
     if (phoneEl) phoneEl.value = user.phone || '';
     const regNumEl = document.getElementById('userRegistrationNumber');
@@ -20756,10 +20809,6 @@ async function saveUser() {
     const phone = document.getElementById('userPhone').value.trim();
     const registrationNumber = document.getElementById('userRegistrationNumber').value.trim();
     const active = document.getElementById('userActive').checked;
-    const userClinicEl = document.getElementById('userClinicId');
-    const selectedClinicId = userClinicEl && userClinicEl.value
-        ? String(userClinicEl.value)
-        : (currentClinicId ? String(currentClinicId) : 'local-default');
 
     // 取得密碼與確認密碼（可能不存在於編輯模式）
     const password = document.getElementById('userPassword') ? document.getElementById('userPassword').value : '';
@@ -20782,10 +20831,6 @@ async function saveUser() {
     // 驗證必填欄位（姓名與職位）
     if (!name || !position) {
         showToast('請填寫必要資料（姓名、職位）！', 'error');
-        return;
-    }
-    if (!selectedClinicId) {
-        showToast('請選擇主要診所！', 'error');
         return;
     }
 
@@ -20845,7 +20890,15 @@ async function saveUser() {
     }
 
     const currentUsersForLimit = usersFromFirebase.length > 0 ? usersFromFirebase : users;
-    const clinicIdForLimit = selectedClinicId;
+    const clinicIdForLimit = (() => {
+        if (editingUserId) {
+            const existing = currentUsersForLimit.find(u => u && String(u.id) === String(editingUserId));
+            if (existing && existing.clinicId !== undefined && existing.clinicId !== null && String(existing.clinicId)) {
+                return String(existing.clinicId);
+            }
+        }
+        return currentClinicId ? String(currentClinicId) : 'local-default';
+    })();
     const limitCheck = canActivateUserUnderClinicLimit({
         users: currentUsersForLimit,
         clinicId: clinicIdForLimit,
@@ -26775,14 +26828,10 @@ class FirebaseDataManager {
             } catch (_omitErr) {
                 dataToWrite = userData;
             }
-            const sanitizedData = {};
-            Object.entries(dataToWrite || {}).forEach(([key, value]) => {
-                if (value !== undefined) sanitizedData[key] = value;
-            });
             await window.firebase.updateDoc(
                 window.firebase.doc(window.firebase.db, 'users', userId),
                 {
-                    ...sanitizedData,
+                    ...dataToWrite,
                     updatedAt: new Date(),
                     updatedBy: currentUser || 'system'
                 }

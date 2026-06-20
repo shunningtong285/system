@@ -68,16 +68,15 @@
       
       
       this.chatNotificationIndicator = null;
+      this.messagePreview = null;
+      this.previewChannelLabel = null;
+      this.previewSenderLabel = null;
+      this.previewTextLabel = null;
+      this.previewHideTimer = null;
+      this.previewInitializedChannels = {};
+      this.lastPreviewedMessageTime = {};
+      this.previewStartTime = 0;
 
-      
-      
-      
-      
-      
-      this.chatPreview = null;
-
-      
-      
       
       
       
@@ -103,22 +102,6 @@
       
       
       
-      this.previewTimer = null;
-
-      
-      
-      
-      
-      
-      
-      
-      
-      this.lastPreviewedTimestamp = 0;
-
-      
-      
-      this.loadLastPreviewedTimestamp = this.loadLastPreviewedTimestamp.bind(this);
-      this.persistLastPreviewedTimestamp = this.persistLastPreviewedTimestamp.bind(this);
     }
 
     
@@ -156,17 +139,8 @@
       
       
       
-      try {
-        this.loadLastPreviewedTimestamp();
-        if (!this.lastPreviewedTimestamp || typeof this.lastPreviewedTimestamp !== 'number') {
-          this.lastPreviewedTimestamp = Date.now();
-          if (typeof this.persistLastPreviewedTimestamp === 'function') {
-            this.persistLastPreviewedTimestamp();
-          }
-        }
-      } catch (_e) {
-        
-      }
+      this.resetPreviewState();
+      this.previewStartTime = Date.now();
       
       
       
@@ -246,17 +220,7 @@
       }
 
       
-      try {
-        if (this.chatPreview) {
-          this.chatPreview.classList.add('hidden');
-        }
-        if (this.previewTimer) {
-          clearTimeout(this.previewTimer);
-          this.previewTimer = null;
-        }
-      } catch (_e) {
-        
-      }
+      this.resetPreviewState();
       this.channelListeners = {};
       this.lastMessageTime = {};
       
@@ -289,6 +253,7 @@
         this.chatPopup.remove();
         this.chatPopup = null;
       }
+      this.destroyPreviewUI();
       this.initialized = false;
       this.currentUser = null;
       this.currentUserUid = null;
@@ -326,28 +291,6 @@
       notifDot.style.transform = 'translate(50%,-50%)';
       button.appendChild(notifDot);
 
-      
-      
-      
-      
-      
-      const preview = document.createElement('div');
-      this.chatPreview = preview;
-      
-      
-      
-      preview.className = 'absolute hidden max-w-xs bg-white text-gray-800 text-sm p-2 rounded-lg shadow-lg border border-gray-200';
-      preview.style.right = '0';
-      
-      
-      
-      preview.style.bottom = '100%';
-      preview.style.marginBottom = '0.5rem';
-      
-      
-      preview.style.pointerEvents = 'none';
-      button.appendChild(preview);
-      
       this.togglePopupHandler = () => this.togglePopup();
       button.addEventListener('click', this.togglePopupHandler);
 
@@ -433,6 +376,7 @@
 
       popup.appendChild(contentWrapper);
       document.body.appendChild(popup);
+      this.createPreviewUI();
 
       
       this.startDragHandler = (ev) => {
@@ -508,6 +452,7 @@
             
           }
         }
+        this.markCurrentChannelAsRead();
       } else {
         this.chatPopup.classList.add('hidden');
       }
@@ -517,6 +462,141 @@
       if (typeof this.updateNewMessageIndicators === 'function') {
         this.updateNewMessageIndicators();
       }
+    }
+
+    createPreviewUI() {
+      if (this.messagePreview) return;
+      const preview = document.createElement('button');
+      this.messagePreview = preview;
+      preview.type = 'button';
+      preview.className = 'hidden fixed w-80 max-w-[calc(100vw-2rem)] bg-white border border-gray-200 rounded-xl shadow-xl text-left p-4';
+      preview.style.right = '1rem';
+      preview.style.bottom = '5.5rem';
+      preview.style.zIndex = '10001';
+      preview.style.transition = 'opacity 0.2s ease, transform 0.2s ease';
+      preview.style.opacity = '0';
+      preview.style.transform = 'translateY(8px)';
+      preview.style.transformOrigin = 'bottom right';
+
+      const channelLabel = document.createElement('div');
+      this.previewChannelLabel = channelLabel;
+      channelLabel.className = 'text-xs font-semibold text-blue-600 mb-1';
+
+      const senderLabel = document.createElement('div');
+      this.previewSenderLabel = senderLabel;
+      senderLabel.className = 'text-sm font-medium text-gray-900 mb-1';
+
+      const textLabel = document.createElement('div');
+      this.previewTextLabel = textLabel;
+      textLabel.className = 'text-sm text-gray-600 break-words';
+
+      preview.appendChild(channelLabel);
+      preview.appendChild(senderLabel);
+      preview.appendChild(textLabel);
+
+      preview.addEventListener('click', () => {
+        preview.classList.add('hidden');
+        this.hideMessagePreview();
+      });
+
+      document.body.appendChild(preview);
+    }
+
+    destroyPreviewUI() {
+      if (this.previewHideTimer) {
+        window.clearTimeout(this.previewHideTimer);
+        this.previewHideTimer = null;
+      }
+      if (this.messagePreview) {
+        this.messagePreview.remove();
+        this.messagePreview = null;
+      }
+      this.previewChannelLabel = null;
+      this.previewSenderLabel = null;
+      this.previewTextLabel = null;
+    }
+
+    hideMessagePreview() {
+      if (!this.messagePreview) return;
+      if (this.previewHideTimer) {
+        window.clearTimeout(this.previewHideTimer);
+        this.previewHideTimer = null;
+      }
+      this.messagePreview.style.opacity = '0';
+      this.messagePreview.style.transform = 'translateY(8px)';
+      window.setTimeout(() => {
+        if (this.messagePreview && this.messagePreview.style.opacity === '0') {
+          this.messagePreview.classList.add('hidden');
+        }
+      }, 200);
+    }
+
+    truncatePreviewText(text) {
+      const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+      if (normalized.length <= 90) {
+        return normalized;
+      }
+      return normalized.slice(0, 90) + '...';
+    }
+
+    getPreviewChannelLabel(channelId) {
+      if (channelId === 'public') {
+        return '主頻道新訊息';
+      }
+      return '私人聊天新訊息';
+    }
+
+    shouldShowPreviewForChannel(channelId) {
+      const popupHidden = this.chatPopup && this.chatPopup.classList.contains('hidden');
+      if (popupHidden) return true;
+      if (channelId === 'public') {
+        return this.currentChannel !== 'public';
+      }
+      return !(this.currentChannel === 'private' && this.privateChatId === channelId);
+    }
+
+    showMessagePreview(channelId, previewData) {
+      if (!this.messagePreview || !previewData) return;
+      const senderName = previewData.senderName || '新訊息';
+      const text = this.truncatePreviewText(previewData.text || '');
+      this.previewChannelLabel.textContent = this.getPreviewChannelLabel(channelId);
+      this.previewSenderLabel.textContent = senderName;
+      this.previewTextLabel.textContent = text || '你收到一則新訊息';
+      this.messagePreview.classList.remove('hidden');
+      this.messagePreview.style.opacity = '1';
+      this.messagePreview.style.transform = 'translateY(0)';
+      if (this.previewHideTimer) {
+        window.clearTimeout(this.previewHideTimer);
+      }
+      this.previewHideTimer = window.setTimeout(() => {
+        this.hideMessagePreview();
+      }, 8000);
+    }
+
+    handleIncomingPreview(channelId, latestMsg, latestTs) {
+      if (!channelId) return;
+      const previousPreviewTs = this.lastPreviewedMessageTime[channelId] || 0;
+      const wasInitialized = !!this.previewInitializedChannels[channelId];
+      this.previewInitializedChannels[channelId] = true;
+      if (!latestMsg || !latestTs) {
+        return;
+      }
+      if (latestTs <= previousPreviewTs) {
+        return;
+      }
+      this.lastPreviewedMessageTime[channelId] = latestTs;
+      const isNewAfterInit = latestTs > (this.previewStartTime || 0);
+      if (!wasInitialized && !isNewAfterInit) {
+        return;
+      }
+      const senderId = latestMsg.senderId || null;
+      if (senderId && String(senderId) === String(this.currentUserUid)) {
+        return;
+      }
+      if (!this.shouldShowPreviewForChannel(channelId)) {
+        return;
+      }
+      this.showMessagePreview(channelId, latestMsg);
     }
 
     
@@ -719,19 +799,7 @@
       this.privateChatId = null;
       this.channelLabel.textContent = '主頻道';
       this.listenToMessages('public');
-
-      
-      
-      
-      const ts = this.lastMessageTime['public'] || Date.now();
-      this.lastSeenTime['public'] = ts;
-      
-      if (typeof this.persistLastSeenTimes === 'function') {
-        this.persistLastSeenTimes();
-      }
-      if (typeof this.updateNewMessageIndicators === 'function') {
-        this.updateNewMessageIndicators();
-      }
+      this.markChannelAsRead('public');
     }
 
     
@@ -747,19 +815,7 @@
       
       this.channelLabel.textContent = userObj.name || userObj.username || '私人聊天';
       this.listenToMessages(chatId);
-
-      
-      
-      
-      const last = this.lastMessageTime[chatId] || Date.now();
-      this.lastSeenTime[chatId] = last;
-      
-      if (typeof this.persistLastSeenTimes === 'function') {
-        this.persistLastSeenTimes();
-      }
-      if (typeof this.updateNewMessageIndicators === 'function') {
-        this.updateNewMessageIndicators();
-      }
+      this.markChannelAsRead(chatId);
     }
 
     
@@ -795,8 +851,8 @@
         const messages = Object.values(data);
         
         messages.sort((a, b) => {
-          const ta = a.timestamp || 0;
-          const tb = b.timestamp || 0;
+          const ta = this.getMessageTimestamp(a);
+          const tb = this.getMessageTimestamp(b);
           return ta - tb;
         });
         
@@ -805,7 +861,7 @@
         let latestTs = 0;
         let latestMsg = null;
         messages.forEach((msg) => {
-          const ts = msg.timestamp || 0;
+          const ts = this.getMessageTimestamp(msg);
           if (ts > latestTs) {
             latestTs = ts;
             latestMsg = msg;
@@ -821,6 +877,7 @@
             timestamp: latestTs
           };
         }
+        this.handleIncomingPreview(channelId, this.lastMessageInfo[channelId] || latestMsg, latestTs);
         
         
         
@@ -836,11 +893,7 @@
           
           const popupHidden = (this.chatPopup && this.chatPopup.classList.contains('hidden'));
           if (isCurrent && !popupHidden) {
-            this.lastSeenTime[channelId] = latestTs;
-            
-            if (typeof this.persistLastSeenTimes === 'function') {
-              this.persistLastSeenTimes();
-            }
+            this.markChannelAsRead(channelId);
           }
         } catch (_e) {
           
@@ -892,7 +945,7 @@
           header.appendChild(nameSpan);
         }
         const timeSpan = document.createElement('span');
-        timeSpan.textContent = this.formatTimestamp(msg.timestamp);
+        timeSpan.textContent = this.formatTimestamp(this.getMessageTimestamp(msg));
         header.appendChild(timeSpan);
         
         const bubble = document.createElement('div');
@@ -928,9 +981,132 @@
     }
 
     
+    getNumericTimestamp(value, fallback = 0) {
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+      }
+      if (typeof value === 'string') {
+        const parsed = parseInt(value, 10);
+        if (!isNaN(parsed)) {
+          return parsed;
+        }
+      }
+      return fallback;
+    }
+
+    
+    getMessageTimestamp(msg) {
+      if (!msg || typeof msg !== 'object') return 0;
+      const serverTimestamp = this.getNumericTimestamp(msg.timestamp, NaN);
+      if (!isNaN(serverTimestamp)) {
+        return serverTimestamp;
+      }
+      return this.getNumericTimestamp(msg.clientTimestamp, 0);
+    }
+
+    
+    getCurrentChannelId() {
+      if (this.currentChannel === 'public') {
+        return 'public';
+      }
+      if (this.currentChannel === 'private' && this.privateChatId) {
+        return this.privateChatId;
+      }
+      return null;
+    }
+
+    
+    getChannelPeerUid(channelId) {
+      if (!channelId || channelId === 'public') return null;
+      const ids = String(channelId).split('_');
+      if (ids.length < 2) return null;
+      return ids.find((id) => String(id) !== String(this.currentUserUid)) || null;
+    }
+
+    
+    buildSummaryPayload(channelId, messageData) {
+      const clientTimestamp = this.getNumericTimestamp(messageData && messageData.clientTimestamp, Date.now());
+      return {
+        channelId: channelId,
+        senderId: messageData && messageData.senderId ? messageData.senderId : null,
+        senderName: messageData && messageData.senderName ? messageData.senderName : '',
+        text: messageData && messageData.text ? messageData.text : '',
+        timestamp: (window.firebase && typeof window.firebase.serverTimestamp === 'function')
+          ? window.firebase.serverTimestamp()
+          : clientTimestamp,
+        clientTimestamp: clientTimestamp,
+        channelType: channelId === 'public' ? 'public' : 'private'
+      };
+    }
+
+    
+    appendSummaryUpdates(updates, channelId, messageData) {
+      if (!updates || !channelId || !messageData) return;
+      const summaryPayload = this.buildSummaryPayload(channelId, messageData);
+      if (channelId === 'public') {
+        updates['chat/summaries/public'] = summaryPayload;
+        return;
+      }
+
+      const peerUid = this.getChannelPeerUid(channelId);
+      if (!peerUid) return;
+      updates[`chat/userSummaries/${this.currentUserUid}/${channelId}`] = {
+        ...summaryPayload,
+        peerUid: peerUid
+      };
+      updates[`chat/userSummaries/${peerUid}/${channelId}`] = {
+        ...summaryPayload,
+        peerUid: this.currentUserUid
+      };
+    }
+
+    
+    applySummaryToChannel(channelId, summary) {
+      if (!channelId || !summary || typeof summary !== 'object') return;
+      const latestTs = this.getMessageTimestamp(summary);
+      if (!latestTs) return;
+      this.lastMessageTime[channelId] = latestTs;
+      this.lastMessageInfo[channelId] = {
+        senderId: summary.senderId || null,
+        senderName: summary.senderName || '',
+        text: summary.text || '',
+        timestamp: latestTs
+      };
+      this.handleIncomingPreview(channelId, this.lastMessageInfo[channelId], latestTs);
+    }
+
+    
+    markChannelAsRead(channelId) {
+      if (!channelId) return;
+      const latestTs = this.lastMessageTime[channelId] || 0;
+      if (!latestTs) {
+        if (typeof this.updateNewMessageIndicators === 'function') {
+          this.updateNewMessageIndicators();
+        }
+        return;
+      }
+      if ((this.lastSeenTime[channelId] || 0) < latestTs) {
+        this.lastSeenTime[channelId] = latestTs;
+        if (typeof this.persistLastSeenTimes === 'function') {
+          this.persistLastSeenTimes();
+        }
+      }
+      if (typeof this.updateNewMessageIndicators === 'function') {
+        this.updateNewMessageIndicators();
+      }
+    }
+
+    
+    markCurrentChannelAsRead() {
+      const channelId = this.getCurrentChannelId();
+      this.markChannelAsRead(channelId);
+    }
+
+    
     formatTimestamp(ts) {
       try {
-        const date = new Date(parseInt(ts, 10));
+        const normalized = this.getNumericTimestamp(ts, NaN);
+        const date = new Date(normalized);
         if (isNaN(date.getTime())) return '';
         const year = date.getFullYear();
         const month = String(date.getMonth() + 1).padStart(2, '0');
@@ -947,13 +1123,16 @@
     sendMessage() {
       const text = (this.messageInput && this.messageInput.value) ? this.messageInput.value.trim() : '';
       if (!text) return;
-      const timestamp = Date.now();
+      const clientTimestamp = Date.now();
       const messageData = {
         senderId: this.currentUserUid,
         
         senderName: (this.currentUser && (this.currentUser.name || this.currentUser.username)) || '',
         text: text,
-        timestamp: timestamp
+        timestamp: (window.firebase && typeof window.firebase.serverTimestamp === 'function')
+          ? window.firebase.serverTimestamp()
+          : clientTimestamp,
+        clientTimestamp: clientTimestamp
       };
       let path;
       if (this.currentChannel === 'public') {
@@ -964,28 +1143,40 @@
         return;
       }
       
-      const msgRef = window.firebase.ref(window.firebase.rtdb, `${path}/${timestamp}`);
-      window.firebase.set(msgRef, messageData).then(() => {
+      const channelId = (this.currentChannel === 'public') ? 'public' : this.privateChatId;
+      const baseRef = window.firebase.ref(window.firebase.rtdb, path);
+      const generatedRef = (window.firebase && typeof window.firebase.push === 'function')
+        ? window.firebase.push(baseRef)
+        : null;
+      const messageKey = generatedRef && generatedRef.key ? generatedRef.key : String(clientTimestamp);
+      const rootRef = window.firebase.ref(window.firebase.rtdb);
+      const updates = {
+        [`${path}/${messageKey}`]: messageData
+      };
+      this.appendSummaryUpdates(updates, channelId, messageData);
+      window.firebase.update(rootRef, updates).then(() => {
         
         this.messageInput.value = '';
         this.charCount.textContent = '0/500';
         this.sendButton.disabled = true;
         
         this.messageInput.style.height = 'auto';
-
-        
-        
-        
-        const channelId = (this.currentChannel === 'public') ? 'public' : this.privateChatId;
         if (channelId) {
-          this.lastSeenTime[channelId] = timestamp;
-          if (typeof this.updateNewMessageIndicators === 'function') {
-            this.updateNewMessageIndicators();
+          this.lastSeenTime[channelId] = clientTimestamp;
+          if ((this.lastMessageTime[channelId] || 0) < clientTimestamp) {
+            this.lastMessageTime[channelId] = clientTimestamp;
           }
-
-          
+          this.lastMessageInfo[channelId] = {
+            senderId: messageData.senderId || null,
+            senderName: messageData.senderName || '',
+            text: messageData.text || '',
+            timestamp: clientTimestamp
+          };
           if (typeof this.persistLastSeenTimes === 'function') {
             this.persistLastSeenTimes();
+          }
+          if (typeof this.updateNewMessageIndicators === 'function') {
+            this.updateNewMessageIndicators();
           }
         }
       }).catch((err) => {
@@ -1011,92 +1202,107 @@
       this.channelListeners = {};
       
       try {
-        const publicRef = window.firebase.ref(window.firebase.rtdb, 'chat/messages/public');
-        
-        const publicQuery = window.firebase.query(publicRef, window.firebase.orderByChild('timestamp'), window.firebase.limitToLast(1));
+        const publicSummaryRef = window.firebase.ref(window.firebase.rtdb, 'chat/summaries/public');
         const publicCallback = (snapshot) => {
-          
-          let latest = 0;
-          let latestMsg = null;
-          snapshot.forEach((child) => {
-            const msg = child.val() || {};
-            const ts = msg.timestamp || 0;
-            if (ts > latest) {
-              latest = ts;
-              latestMsg = msg;
-            }
-          });
-          
-          this.lastMessageTime['public'] = latest;
-          
-          if (latestMsg) {
-            this.lastMessageInfo['public'] = {
-              senderId: latestMsg.senderId || null,
-              senderName: latestMsg.senderName || '',
-              text: latestMsg.text || '',
-              timestamp: latest
-            };
+          const summary = snapshot.val();
+          if (summary) {
+            this.applySummaryToChannel('public', summary);
           }
           if (typeof this.updateUserListOrder === 'function') {
             this.updateUserListOrder();
           }
         };
-        window.firebase.onValue(publicQuery, publicCallback);
-        this.channelListeners['public'] = { ref: publicQuery, callback: publicCallback };
+        window.firebase.onValue(publicSummaryRef, publicCallback);
+        this.channelListeners['public'] = { ref: publicSummaryRef, callback: publicCallback };
       } catch (err) {
-        console.error('ChatModule: Failed to attach last message listener for public', err);
+        console.error('ChatModule: Failed to attach public summary listener', err);
       }
       
       try {
-        const list = Array.isArray(this.usersList) ? this.usersList : [];
-        list.forEach((u) => {
-          if (!u) return;
-          const uid = u.uid || u.id;
-          if (!uid) return;
-          
-          if (String(uid) === String(this.currentUserUid) || String(uid) === String(this.currentUser && this.currentUser.id)) return;
-          const chatId = [String(this.currentUserUid), String(uid)].sort().join('_');
-          const path = `chat/private/${chatId}`;
-          const baseRef = window.firebase.ref(window.firebase.rtdb, path);
-          
-          const q = window.firebase.query(baseRef, window.firebase.orderByChild('timestamp'), window.firebase.limitToLast(1));
-          const cb = (snapshot) => {
-            let latest = 0;
-            let latestMsg = null;
-            snapshot.forEach((child) => {
-              const msg = child.val() || {};
-              const ts = msg.timestamp || 0;
-              if (ts > latest) {
-                latest = ts;
-                latestMsg = msg;
-              }
-            });
-            
-            this.lastMessageTime[chatId] = latest;
-            
-            if (latestMsg) {
-              this.lastMessageInfo[chatId] = {
-                senderId: latestMsg.senderId || null,
-                senderName: latestMsg.senderName || '',
-                text: latestMsg.text || '',
-                timestamp: latest
-              };
-            }
-            if (typeof this.updateUserListOrder === 'function') {
-              this.updateUserListOrder();
-            }
-          };
-          window.firebase.onValue(q, cb);
-          this.channelListeners[chatId] = { ref: q, callback: cb };
-        });
+        const summaryRef = window.firebase.ref(window.firebase.rtdb, `chat/userSummaries/${this.currentUserUid}`);
+        const summaryCallback = (snapshot) => {
+          const summaryMap = snapshot.val() || {};
+          Object.keys(summaryMap).forEach((channelId) => {
+            this.applySummaryToChannel(channelId, summaryMap[channelId]);
+          });
+          this.bootstrapMissingConversationSummaries(summaryMap);
+          if (typeof this.updateUserListOrder === 'function') {
+            this.updateUserListOrder();
+          }
+        };
+        window.firebase.onValue(summaryRef, summaryCallback);
+        this.channelListeners['userSummaries'] = { ref: summaryRef, callback: summaryCallback };
       } catch (err) {
-        console.error('ChatModule: Failed to attach last message listeners for private chats', err);
+        console.error('ChatModule: Failed to attach user summary listener', err);
       }
 
       
       
       if (typeof this.updateNewMessageIndicators === 'function') {
         this.updateNewMessageIndicators();
+      }
+    }
+
+    
+    bootstrapMissingConversationSummaries(summaryMap = {}) {
+      try {
+        const get = window.firebase && window.firebase.get;
+        const ref = window.firebase && window.firebase.ref;
+        const query = window.firebase && window.firebase.query;
+        const orderByChild = window.firebase && window.firebase.orderByChild;
+        const limitToLast = window.firebase && window.firebase.limitToLast;
+        const rtdb = window.firebase && window.firebase.rtdb;
+        if (!get || !ref || !query || !orderByChild || !limitToLast || !rtdb) {
+          return;
+        }
+
+        const tasks = [];
+        if (!summaryMap.public && !this.lastMessageInfo['public']) {
+          const publicRef = ref(rtdb, 'chat/messages/public');
+          const publicQuery = query(publicRef, orderByChild('timestamp'), limitToLast(1));
+          tasks.push(
+            get(publicQuery).then((snapshot) => {
+              snapshot.forEach((child) => {
+                this.applySummaryToChannel('public', child.val() || {});
+              });
+            }).catch((err) => {
+              console.error('ChatModule: Failed to bootstrap public summary', err);
+            })
+          );
+        }
+
+        const list = Array.isArray(this.usersList) ? this.usersList : [];
+        list.forEach((u) => {
+          if (!u) return;
+          const uid = u.uid || u.id;
+          if (!uid) return;
+          if (String(uid) === String(this.currentUserUid) || String(uid) === String(this.currentUser && this.currentUser.id)) return;
+
+          const chatId = [String(this.currentUserUid), String(uid)].sort().join('_');
+          if (summaryMap[chatId] || this.lastMessageInfo[chatId]) return;
+
+          const chatRef = ref(rtdb, `chat/private/${chatId}`);
+          const lastMessageQuery = query(chatRef, orderByChild('timestamp'), limitToLast(1));
+          tasks.push(
+            get(lastMessageQuery).then((snapshot) => {
+              snapshot.forEach((child) => {
+                this.applySummaryToChannel(chatId, child.val() || {});
+              });
+            }).catch((err) => {
+              console.error('ChatModule: Failed to bootstrap private summary', err);
+            })
+          );
+        });
+
+        if (tasks.length > 0) {
+          Promise.allSettled(tasks).then(() => {
+            if (typeof this.updateUserListOrder === 'function') {
+              this.updateUserListOrder();
+            }
+          });
+        }
+      } catch (err) {
+        console.error('ChatModule: Failed to bootstrap conversation summaries', err);
       }
     }
 
@@ -1264,148 +1470,9 @@
         }
       }
 
-      
-      
-      
-      
-      
-      if (typeof this.updateChatPreview === 'function') {
-        this.updateChatPreview();
-      }
     }
 
     
-    updateChatPreview() {
-      
-      if (!this.chatPreview) return;
-      
-      const popupHidden = (this.chatPopup && this.chatPopup.classList.contains('hidden'));
-      if (!popupHidden) {
-        
-        if (this.previewTimer) {
-          clearTimeout(this.previewTimer);
-          this.previewTimer = null;
-        }
-        
-        if (!this.chatPreview.classList.contains('hidden')) {
-          this.chatPreview.classList.remove('fade-in');
-          this.chatPreview.classList.add('fade-out');
-          
-          setTimeout(() => {
-            this.chatPreview.classList.add('hidden');
-            this.chatPreview.classList.remove('fade-out');
-          }, 300);
-        } else {
-          
-          this.chatPreview.classList.add('hidden');
-        }
-        return;
-      }
-      
-      
-      let latestInfo = null;
-      let latestTs = 0;
-      try {
-        const channels = Object.keys(this.lastMessageTime || {});
-        channels.forEach((ch) => {
-          const lastMsgTs = this.lastMessageTime[ch] || 0;
-          const lastSeenTs = this.lastSeenTime[ch] || 0;
-          
-          if (lastMsgTs > lastSeenTs && lastMsgTs > latestTs) {
-            const info = this.lastMessageInfo && this.lastMessageInfo[ch];
-            if (!info) return;
-            
-            if (String(info.senderId) === String(this.currentUserUid)) return;
-            latestInfo = info;
-            latestTs = lastMsgTs;
-          }
-        });
-      } catch (_err) {
-        
-      }
-      
-      
-      
-      
-      if (latestInfo) {
-        const latestTsValue = latestInfo.timestamp || 0;
-        if (!(latestTsValue > (this.lastPreviewedTimestamp || 0))) {
-          
-          latestInfo = null;
-        }
-      }
-      if (latestInfo) {
-        
-        
-        const escapeHtml = (str) => {
-          return String(str || '').replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/"/g, '&quot;')
-            .replace(/'/g, '&#39;');
-        };
-        const maxLen = 60;
-        let text = latestInfo.text || '';
-        if (text.length > maxLen) {
-          text = text.slice(0, maxLen) + '…';
-        }
-        const safeName = escapeHtml(latestInfo.senderName || '');
-        const safeText = escapeHtml(text);
-        // Format preview with sender name on top and message below. Use Tailwind classes for styling.
-        // The name is bold and slightly larger; the message is normal weight.
-        this.chatPreview.innerHTML = `
-          <div class="font-medium text-sm text-gray-800 mb-0.5">${safeName}</div>
-          <div class="text-gray-700 text-sm leading-tight break-words">${safeText}</div>
-        `;
-        // Remove any hiding and fade-out classes before showing
-        this.chatPreview.classList.remove('hidden', 'fade-out');
-        // Trigger fade-in animation
-        this.chatPreview.classList.add('fade-in');
-        // Remove fade-in class after animation completes so that future animations can retrigger
-        setTimeout(() => {
-          this.chatPreview.classList.remove('fade-in');
-        }, 300);
-        // Clear any existing timer before starting a new one
-        if (this.previewTimer) {
-          clearTimeout(this.previewTimer);
-        }
-        // Start timer to auto-hide preview after 6 seconds
-        this.previewTimer = setTimeout(() => {
-          // Initiate fade-out
-          this.chatPreview.classList.remove('fade-in');
-          this.chatPreview.classList.add('fade-out');
-          // After fade-out completes, hide and clean up
-          setTimeout(() => {
-            this.chatPreview.classList.add('hidden');
-            this.chatPreview.classList.remove('fade-out');
-          }, 300);
-        }, 6000);
-        // Update the lastPreviewedTimestamp so this message will not
-        // trigger another preview. Persist to localStorage.
-        this.lastPreviewedTimestamp = latestInfo.timestamp || 0;
-        if (typeof this.persistLastPreviewedTimestamp === 'function') {
-          this.persistLastPreviewedTimestamp();
-        }
-      } else {
-        // No unread messages or none that qualify; hide preview and clear timer
-        if (this.previewTimer) {
-          clearTimeout(this.previewTimer);
-          this.previewTimer = null;
-        }
-        // If preview is visible, fade it out then hide
-        if (!this.chatPreview.classList.contains('hidden')) {
-          this.chatPreview.classList.remove('fade-in');
-          this.chatPreview.classList.add('fade-out');
-          setTimeout(() => {
-            this.chatPreview.classList.add('hidden');
-            this.chatPreview.classList.remove('fade-out');
-          }, 300);
-        } else {
-          this.chatPreview.classList.add('hidden');
-        }
-      }
-    }
-
     /**
      * Persist the lastSeenTime map to localStorage so that unread indicators
      * remain accurate across page reloads and logins. The data is stored
@@ -1470,43 +1537,25 @@
       }
     }
 
-    /**
-     * Persist the lastPreviewedTimestamp to localStorage. This ensures that
-     * the chat preview does not repeatedly show messages that were already
-     * alerted to the user in previous sessions. The timestamp is stored
-     * under a key unique to the current user's UID. Errors accessing
-     * localStorage are silently ignored.
-     */
-    persistLastPreviewedTimestamp() {
-      try {
-        if (!this.currentUserUid) return;
-        const key = `chat_lastPreview_${this.currentUserUid}`;
-        const ts = (typeof this.lastPreviewedTimestamp === 'number') ? this.lastPreviewedTimestamp : 0;
-        localStorage.setItem(key, String(ts));
-      } catch (_e) {
-        // Ignore localStorage errors (e.g. quota exceeded)
+    resetPreviewState() {
+      if (this.previewHideTimer) {
+        window.clearTimeout(this.previewHideTimer);
+        this.previewHideTimer = null;
       }
-    }
-
-    /**
-     * Load the lastPreviewedTimestamp from localStorage. If no value is
-     * found or the value is invalid, the timestamp remains zero. This
-     * method should be called after determining the currentUserUid in
-     * init() and before any previews may be displayed. Errors
-     * accessing or parsing localStorage are silently ignored.
-     */
-    loadLastPreviewedTimestamp() {
+      this.previewInitializedChannels = {};
+      this.lastPreviewedMessageTime = {};
+      this.previewStartTime = 0;
+      if (this.messagePreview) {
+        this.messagePreview.classList.add('hidden');
+        this.messagePreview.style.opacity = '0';
+        this.messagePreview.style.transform = 'translateY(8px)';
+      }
       try {
-        if (!this.currentUserUid) return;
-        const key = `chat_lastPreview_${this.currentUserUid}`;
-        const raw = localStorage.getItem(key);
-        if (!raw) return;
-        const val = parseInt(raw, 10);
-        if (!isNaN(val)) {
-          this.lastPreviewedTimestamp = val;
+        if (this.currentUserUid) {
+          localStorage.removeItem(`chat_lastPreview_${this.currentUserUid}`);
         }
       } catch (_e) {
-        // Ignore localStorage errors
+        
       }
     }
 
@@ -1573,7 +1622,7 @@
      */
     playNotificationSound() {
       try {
-        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const AudioContext = window.AudioContext || window['webkitAudioContext'];
         if (!AudioContext) return;
         const ctx = new AudioContext();
         const oscillator = ctx.createOscillator();
