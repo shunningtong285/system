@@ -5229,35 +5229,153 @@ async function waitForFirebaseConnectionStatus(timeoutMs = 2000) {
     }
 }
 
+const USER_AUTH_INDEX_COLLECTION = 'userAuthIndex';
+
+async function getAuthorizedUserFromIndex(uid) {
+    if (!uid) return null;
+
+    await waitForFirebaseDb();
+
+    if (!(window.firebase && window.firebase.getDoc && window.firebase.doc)) {
+        return null;
+    }
+
+    const indexRef = window.firebase.doc(window.firebase.db, USER_AUTH_INDEX_COLLECTION, String(uid));
+    const indexSnap = await window.firebase.getDoc(indexRef);
+    if (!indexSnap || !indexSnap.exists()) {
+        return null;
+    }
+
+    const indexData = indexSnap.data() || {};
+    const userId = indexData.userId || indexData.legacyUserId || indexData.id || '';
+    if (!userId) {
+        return null;
+    }
+
+    const userRef = window.firebase.doc(window.firebase.db, 'users', String(userId));
+    const userSnap = await window.firebase.getDoc(userRef);
+    if (!userSnap || !userSnap.exists()) {
+        return null;
+    }
+
+    return { id: userSnap.id, ...userSnap.data() };
+}
+
+async function upsertAuthorizedUserIndex(userRecord, uidOverride = '') {
+    const uid = uidOverride || (userRecord && userRecord.uid) || '';
+    const userId = userRecord && userRecord.id ? String(userRecord.id) : '';
+
+    if (!uid || !userId) return false;
+
+    await waitForFirebaseDb();
+
+    if (!(window.firebase && window.firebase.setDoc && window.firebase.doc)) {
+        return false;
+    }
+
+    const indexRef = window.firebase.doc(window.firebase.db, USER_AUTH_INDEX_COLLECTION, String(uid));
+    await window.firebase.setDoc(indexRef, {
+        uid: String(uid),
+        userId: userId,
+        email: userRecord && userRecord.email ? String(userRecord.email).trim() : '',
+        active: userRecord ? userRecord.active !== false : true,
+        clinicId: userRecord && userRecord.clinicId ? userRecord.clinicId : '',
+        username: userRecord && userRecord.username ? userRecord.username : '',
+        name: userRecord && userRecord.name ? userRecord.name : '',
+        updatedAt: new Date()
+    }, { merge: true });
+
+    return true;
+}
+
+async function removeAuthorizedUserIndex(uid) {
+    if (!uid) return false;
+
+    await waitForFirebaseDb();
+
+    if (!(window.firebase && window.firebase.deleteDoc && window.firebase.doc)) {
+        return false;
+    }
+
+    const indexRef = window.firebase.doc(window.firebase.db, USER_AUTH_INDEX_COLLECTION, String(uid));
+    await window.firebase.deleteDoc(indexRef);
+    return true;
+}
+
+async function fetchLegacyAuthorizedUserByUidOrEmail(uid, email) {
+    await waitForFirebaseDb();
+    const colRef = window.firebase.collection(window.firebase.db, 'users');
+
+    if (uid) {
+        const q1 = window.firebase.firestoreQuery(
+            colRef,
+            window.firebase.where('uid', '==', uid),
+            window.firebase.limit(1)
+        );
+        const snap1 = await window.firebase.getDocs(q1);
+        if (snap1 && !snap1.empty) {
+            const docSnap = snap1.docs[0];
+            return { id: docSnap.id, ...docSnap.data() };
+        }
+    }
+
+    if (email) {
+        const q2 = window.firebase.firestoreQuery(
+            colRef,
+            window.firebase.where('email', '==', email),
+            window.firebase.limit(1)
+        );
+        const snap2 = await window.firebase.getDocs(q2);
+        if (snap2 && !snap2.empty) {
+            const docSnap = snap2.docs[0];
+            return { id: docSnap.id, ...docSnap.data() };
+        }
+    }
+
+    return null;
+}
+
 async function fetchAuthorizedUserByUidOrEmail(uid, email) {
     try {
-        await waitForFirebaseDb();
-        const colRef = window.firebase.collection(window.firebase.db, 'users');
         if (uid) {
-            const q1 = window.firebase.firestoreQuery(
-                colRef,
-                window.firebase.where('uid', '==', uid),
-                window.firebase.limit(1)
-            );
-            const snap1 = await window.firebase.getDocs(q1);
-            if (snap1 && !snap1.empty) {
-                const docSnap = snap1.docs[0];
-                return { id: docSnap.id, ...docSnap.data() };
+            const indexedUser = await getAuthorizedUserFromIndex(uid);
+            if (indexedUser) {
+                return indexedUser;
             }
         }
-        if (email) {
-            const q2 = window.firebase.firestoreQuery(
-                colRef,
-                window.firebase.where('email', '==', email),
-                window.firebase.limit(1)
-            );
-            const snap2 = await window.firebase.getDocs(q2);
-            if (snap2 && !snap2.empty) {
-                const docSnap = snap2.docs[0];
-                return { id: docSnap.id, ...docSnap.data() };
+
+        const legacyUser = await fetchLegacyAuthorizedUserByUidOrEmail(uid, email);
+        if (!legacyUser) {
+            return null;
+        }
+
+        let hydratedUser = legacyUser;
+
+        if (uid && (!legacyUser.uid || legacyUser.uid !== uid)) {
+            try {
+                await window.firebase.updateDoc(
+                    window.firebase.doc(window.firebase.db, 'users', String(legacyUser.id)),
+                    {
+                        uid: uid,
+                        updatedAt: new Date(),
+                        updatedBy: currentUser || 'system'
+                    }
+                );
+                hydratedUser = { ...legacyUser, uid: uid };
+            } catch (syncErr) {
+                console.warn('補寫授權用戶 UID 失敗:', syncErr);
             }
         }
-        return null;
+
+        if (uid) {
+            try {
+                await upsertAuthorizedUserIndex(hydratedUser, uid);
+            } catch (indexErr) {
+                console.warn('建立授權用戶索引失敗:', indexErr);
+            }
+        }
+
+        return hydratedUser;
     } catch (error) {
         console.error('查詢授權用戶資料失敗:', error);
         return null;
@@ -5563,6 +5681,7 @@ async function attemptMainLogin() {
         
         try {
             if (firebaseUser && typeof firebaseUser.getIdTokenResult === 'function') {
+                await firebaseUser.getIdToken(true);
                 const idTokenResult = await firebaseUser.getIdTokenResult();
                 if (idTokenResult && idTokenResult.claims) {
                     
@@ -8177,6 +8296,55 @@ async function loadInquiryOptions(patient) {
                 console.error('初始化日期選擇器失敗：', err);
             }
         }
+
+        function parseAppointmentPickerDate(value) {
+            const raw = String(value || '').trim();
+            const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!match) return null;
+            const parsed = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+            return isNaN(parsed.getTime()) ? null : parsed;
+        }
+
+        function formatLocalDateTimeInputValue(date) {
+            if (!(date instanceof Date) || isNaN(date.getTime())) return '';
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const day = String(date.getDate()).padStart(2, '0');
+            const hours = String(date.getHours()).padStart(2, '0');
+            const minutes = String(date.getMinutes()).padStart(2, '0');
+            return `${year}-${month}-${day}T${hours}:${minutes}`;
+        }
+
+        function getDefaultAppointmentDateTimeValue() {
+            const now = new Date();
+            now.setMinutes(now.getMinutes() + 5);
+
+            try {
+                const picker = document.getElementById('appointmentDatePicker');
+                const selectedDate = picker ? parseAppointmentPickerDate(picker.value) : null;
+                if (selectedDate) {
+                    const startOfSelectedDay = new Date(selectedDate.getFullYear(), selectedDate.getMonth(), selectedDate.getDate());
+                    const startOfToday = new Date();
+                    startOfToday.setHours(0, 0, 0, 0);
+
+                    if (startOfSelectedDay.getTime() > startOfToday.getTime()) {
+                        return formatLocalDateTimeInputValue(new Date(
+                            selectedDate.getFullYear(),
+                            selectedDate.getMonth(),
+                            selectedDate.getDate(),
+                            now.getHours(),
+                            now.getMinutes(),
+                            0,
+                            0
+                        ));
+                    }
+                }
+            } catch (_e) {
+                // 回退到目前時間即可
+            }
+
+            return formatLocalDateTimeInputValue(now);
+        }
         
 
 async function searchPatientsForRegistration() {
@@ -8543,19 +8711,9 @@ async function selectPatientForRegistration(patientId) {
             // 載入醫師選項
             loadDoctorOptions();
             
-            // 設置預設掛號時間為當前時間（加5分鐘避免時間過期）
-            const nowForDefault = new Date();
-            nowForDefault.setMinutes(nowForDefault.getMinutes() + 5); // 加5分鐘作為預設值
-            const defYear = nowForDefault.getFullYear();
-            const defMonth = String(nowForDefault.getMonth() + 1).padStart(2, '0');
-            const defDay = String(nowForDefault.getDate()).padStart(2, '0');
-            const defHours = String(nowForDefault.getHours()).padStart(2, '0');
-            const defMinutes = String(nowForDefault.getMinutes()).padStart(2, '0');
-            const localDateTime = `${defYear}-${defMonth}-${defDay}T${defHours}:${defMinutes}`;
-
             // 設置掛號時間輸入欄的預設值
             const appointmentInput = document.getElementById('appointmentDateTime');
-            appointmentInput.value = localDateTime;
+            appointmentInput.value = getDefaultAppointmentDateTimeValue();
 
             // 設置允許選擇的最小日期時間為今日 00:00
             // 依需求，掛號時間只能選擇「今日」或之後的日期
@@ -26656,6 +26814,14 @@ class FirebaseDataManager {
                     createdBy: currentUser || 'system'
                 }
             );
+
+            if (dataToWrite && dataToWrite.uid) {
+                try {
+                    await upsertAuthorizedUserIndex({ id: docRef.id, ...dataToWrite }, dataToWrite.uid);
+                } catch (indexErr) {
+                    console.warn('新增用戶後建立授權索引失敗:', indexErr);
+                }
+            }
             
             console.log('用戶數據已添加到 Firebase:', docRef.id);
             // 新增用戶後清除快取並移除本地存檔
@@ -26809,6 +26975,16 @@ class FirebaseDataManager {
             } catch (_omitErr) {
                 dataToWrite = userData;
             }
+            let existingUser = null;
+            try {
+                const userRef = window.firebase.doc(window.firebase.db, 'users', userId);
+                const userSnap = await window.firebase.getDoc(userRef);
+                if (userSnap && userSnap.exists()) {
+                    existingUser = { id: userSnap.id, ...userSnap.data() };
+                }
+            } catch (readErr) {
+                console.warn('更新用戶前讀取舊資料失敗:', readErr);
+            }
             await window.firebase.updateDoc(
                 window.firebase.doc(window.firebase.db, 'users', userId),
                 {
@@ -26817,6 +26993,18 @@ class FirebaseDataManager {
                     updatedBy: currentUser || 'system'
                 }
             );
+            const mergedUser = {
+                ...(existingUser || {}),
+                ...(dataToWrite || {}),
+                id: userId
+            };
+            if (mergedUser.uid) {
+                try {
+                    await upsertAuthorizedUserIndex(mergedUser, mergedUser.uid);
+                } catch (indexErr) {
+                    console.warn('更新授權用戶索引失敗:', indexErr);
+                }
+            }
             // 更新用戶後清除用戶緩存並移除本地存檔
             this.usersCache = null;
             try {
@@ -26833,9 +27021,26 @@ class FirebaseDataManager {
 
     async deleteUser(userId) {
         try {
+            let existingUser = null;
+            try {
+                const userRef = window.firebase.doc(window.firebase.db, 'users', userId);
+                const userSnap = await window.firebase.getDoc(userRef);
+                if (userSnap && userSnap.exists()) {
+                    existingUser = { id: userSnap.id, ...userSnap.data() };
+                }
+            } catch (readErr) {
+                console.warn('刪除用戶前讀取舊資料失敗:', readErr);
+            }
             await window.firebase.deleteDoc(
                 window.firebase.doc(window.firebase.db, 'users', userId)
             );
+            if (existingUser && existingUser.uid) {
+                try {
+                    await removeAuthorizedUserIndex(existingUser.uid);
+                } catch (indexErr) {
+                    console.warn('刪除授權用戶索引失敗:', indexErr);
+                }
+            }
             // 刪除用戶後清除緩存並移除本地存檔
             this.usersCache = null;
             try {
